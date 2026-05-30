@@ -1,0 +1,6 @@
+build/
+*.o
+*.out
+CMakeFiles/
+CMakeCache.txt
+mlpcpp_ad_test
