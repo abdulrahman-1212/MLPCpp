@@ -1,24 +1,27 @@
-cmake_minimum_required(VERSION 3.10)
-project(MLPCpp_AD_Test CXX)
-
+cmake_minimum_required(VERSION 3.14)
+project(MLPCpp_AD_Test)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ---- SU2 root (for CoDiPack) ----
 set(SU2_ROOT /root/SU2)
-
-include_directories(
-    ${SU2_ROOT}
-    ${SU2_ROOT}/Common/include
-    ${SU2_ROOT}/externals/codi/include
-)
 
 add_executable(mlpcpp_ad_test
     TestCase/test_codi.cpp
 )
 
+target_include_directories(mlpcpp_ad_test PRIVATE
+    ${SU2_ROOT}/Common/include
+    ${SU2_ROOT}/externals/codi/include
+    ${SU2_ROOT}/externals/medi/include
+    ${SU2_ROOT}/externals/opdi/include
+)
+
 target_compile_definitions(mlpcpp_ad_test PRIVATE
     CODI_REVERSE_TYPE
-    ENABLE_SU2_AD
+    CODI_JACOBIAN_LINEAR_TAPE
     HAVE_CODI
+)
+
+target_link_libraries(mlpcpp_ad_test PRIVATE
+    /root/SU2/build/Common/src/libSU2CommonAD.a
 )
