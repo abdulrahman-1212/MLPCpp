@@ -77,6 +77,27 @@ su2double loss_function(
     return y*y;
 }
 
+static su2double fd_grad(
+    const std::vector<su2double>& p,
+    std::size_t idx,
+    su2double x1, su2double x2,
+    su2double h = 1e-5)
+{
+    auto net = [&](const std::vector<su2double>& q) -> su2double {
+        su2double h1 = std::tanh(q[0]*x1 + q[1]*x2);
+        su2double h2 = std::tanh(q[2]*x1 + q[3]*x2);
+        su2double y = q[4]*h1 + q[5]*h2 + q[6];
+
+        return y * y;
+    };
+
+    std::vector<su2double> pp = p, pm = p;
+    pp[idx] += h;
+    pm[idx] -= h;
+
+    return (net(pp) - net(pm)) / (2.0 * h);
+}
+
 int main() {
 
     const su2double x1 = 1.0;
@@ -102,7 +123,6 @@ int main() {
 
     AD::StopRecording();
 
-    // ============================================
     // BACKWARD PASS
 
     SU2_TYPE::SetDerivative(L, 1.0);
@@ -123,6 +143,22 @@ int main() {
 
     AD::ClearAdjoints();
     AD::Reset();
+
+
+    std::vector<su2double> fd(7);
+    for (std::size_t i = 0; i < 7; ++i)
+        fd[i] = fd_grad(p, i, x1, x2);
+
+    
+    std::cout << "\n=== Finite Difference Gradients ===\n";
+    std::cout << "dL/dw11 = " << fd[0] << "\n";
+    std::cout << "dL/dw12 = " << fd[1] << "\n";
+    std::cout << "dL/dw21 = " << fd[2] << "\n";
+    std::cout << "dL/dw22 = " << fd[3] << "\n";
+    std::cout << "dL/dv1  = " << fd[4] << "\n";
+    std::cout << "dL/dv2  = " << fd[5] << "\n";
+    std::cout << "dL/db2  = " << fd[6] << "\n";
+
 
     return 0;
 }
