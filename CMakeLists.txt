@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SU2_ROOT /root/SU2)
 
 add_executable(mlpcpp_ad_test
-    TestCase/test_codi.cpp
+    UnitTests/test_codi.cpp
 )
 
 target_include_directories(mlpcpp_ad_test PRIVATE
