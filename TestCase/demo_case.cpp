@@ -121,7 +121,7 @@ int main() {
     anneal_cfg.alpha        = 0.9;
     anneal_cfg.lambda_init  = 1.0;
     anneal_cfg.lambda_min   = 1e-4;
-    anneal_cfg.lambda_max   = 5.0;
+    anneal_cfg.lambda_max   = 10.0;
     CGradientAnnealer annealer(anneal_cfg);
 
 
