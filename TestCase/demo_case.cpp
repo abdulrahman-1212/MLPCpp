@@ -6,6 +6,25 @@
  * Physics loss: enforce dy/du = 0 at the origin (u=0, v=0),
  * i.e. the network's first input-Jacobian should be zero there.
  * L_phys = (dy/du)^2
+ * 
+ * =========
+ * How to run:
+ * =========
+ * for now, I added the test case to unit tests but may separate them in the future when I create other test cases
+ * 
+ * from MLPCpp dir write these commands:
+ * ```
+ * mkdir build && cd build
+ * cmake ..
+ * make test_demo_case
+ * cd ../TestCase
+ * ../build/UnitTests/test_demo_case
+ * 
+ * ```
+ * ensure codi correct path at UnitTest/CMakeLists.txt
+ * if you are using MLPCpp from SU2 (as a standalone project), you do not need to do anything
+ * just checkout to the feature/demo_case_and_losses_implementation
+ * 
  */
 
 #define MLP_CUSTOM_TYPE codi::RealReverse
@@ -157,7 +176,7 @@ int main() {
 
 
     // training loop
-    const unsigned int epochs = 50;
+    const unsigned int epochs = 80;
     std::cout << "Starting training (" << epochs << " epochs)...\n\n";
     std::cout << std::left
               << std::setw(8)  << "Epoch"
