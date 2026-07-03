@@ -1,19 +1,13 @@
-#pragma one
+#pragma once
 #include <stdexcept>
 #include "CBaseLoss.hpp"
 
 namespace MLPToolbox {
 
-
-class CDataLoss : CBaseLoss {
+class CDataLoss : public CBaseLoss {  // FIX 1: Added 'public'
 public:
     CDataLoss() : CBaseLoss("data loss") {}
 
-     /*!
-     * \brief Evaluate MSE loss.
-     * \param predictions - Network predictions (outputs[0] is y_pred)
-     * \param ref_data - Reference data (ref_data[i][0] is y_true)
-     */
     mlpdouble Evaluate(
         const std::vector<PredictionResult>& predictions,
         const std::vector<std::vector<mlpdouble>>& ref_data
@@ -31,34 +25,28 @@ public:
         const size_t N = predictions.size();
         const size_t n_outputs = predictions[0].outputs.size();
 
-        // Validate consistency across all points
         for (size_t i = 0; i < N; ++i) {
             if (predictions[i].outputs.size() != n_outputs) {
-                throw std::runtime_error(
-                    "CDataLoss: inconsistent number of outputs in predictions");
+                throw std::runtime_error("CDataLoss: inconsistent number of outputs in predictions");
             }
-
             if (ref_data[i].size() != n_outputs) {
-                throw std::runtime_error(
-                    "CDataLoss: ref_data[i] size does not match number of outputs");
+                throw std::runtime_error("CDataLoss: ref_data[i] size does not match number of outputs");
             }
         }
 
-       for (size_t i = 0; i < N; ++i) {
+        for (size_t i = 0; i < N; ++i) {
             for (size_t j = 0; j < n_outputs; ++j) {
-                mlpdouble y_pred = predictions[i].outputs[j];
-                mlpdouble y_true = ref_data[i][j];
-                mlpdouble diff = y_pred - y_true;
+                mlpdouble diff = predictions[i].outputs[j] - ref_data[i][j];
                 mse += diff * diff;
             }
         }
 
         mlpdouble loss = mse / static_cast<mlpdouble>(N * n_outputs);
-        last_loss_value_ = loss.getValue();
+        
+        // FIX 2: Use to_double instead of .getValue()
+        last_loss_value_ = to_double(loss); 
         return loss;
     }
-    
 };
 
-
-}   // namespace MLPToolbox
+} // namespace MLPToolbox

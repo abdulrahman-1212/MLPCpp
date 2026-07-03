@@ -10,6 +10,8 @@ add_executable(test_adam CAdam_tests.cpp)
 add_executable(test_annealer CGradientAnnealer_tests.cpp)
 add_executable(test_codi_jacobian test_codi_neuralnetwork.cpp)
 add_executable(test_mlp_trainer CMLPTrainer_tests.cpp)
+add_executable(test_data_loss CDataLoss_tests.cpp)
+add_executable(test_physics_loss CPhysicsLoss_tests.cpp)
 add_executable(test_demo_case ../TestCase/demo_case.cpp)
 
 
@@ -26,6 +28,8 @@ target_include_directories(test_adam PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_annealer PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_codi_jacobian PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_mlp_trainer PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_data_loss PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_physics_loss PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_demo_case PRIVATE ${TEST_INCLUDE_DIRS})
 
 
@@ -36,6 +40,8 @@ add_test(NAME test_adam COMMAND test_adam)
 add_test(NAME test_annealer COMMAND test_annealer)
 add_test(NAME test_codi_jacobian COMMAND test_codi_jacobian)
 add_test(NAME test_mlp_trainer COMMAND test_mlp_trainer)
+add_test(NAME test_data_loss COMMAND test_data_loss)
+add_test(NAME test_physics_loss COMMAND test_physics_loss)
 add_test(NAME test_demo_case COMMAND test_demo_case)
 
 # Tests Properties

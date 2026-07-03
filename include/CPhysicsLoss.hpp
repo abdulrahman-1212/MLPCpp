@@ -1,93 +1,104 @@
 #pragma once
-
-#include <cmath>
-#include <algorithm>
+#include <vector>
+#include <string>
 #include <stdexcept>
-
+#include <algorithm>
 #include "CBaseLoss.hpp"
-
 
 namespace MLPToolbox {
 
-struct KOmegaSSTConstants {
-    mlpdouble beta_star    = mlpdouble(0.09);           // k-destruction coefficient
-    mlpdouble alpha        = mlpdouble(5.0 / 9.0);      // omega-production coefficient
-    mlpdouble beta         = mlpdouble(0.075);           // omega-destruction coefficient
-    mlpdouble sigma_k      = mlpdouble(0.85);            // k diffusivity coefficient
-    mlpdouble sigma_omega  = mlpdouble(0.5);             // omega diffusivity coefficient (inner)
-    mlpdouble sigma_omega2 = mlpdouble(0.856);           // omega diffusivity coefficient (cross-diff)
-    mlpdouble nu           = mlpdouble(1.0e-5);          // molecular kinematic viscosity
-    mlpdouble omega_min    = mlpdouble(1.0e-10);         // floor to avoid division by zero
-    mlpdouble k_min        = mlpdouble(1.0e-10);         // floor for production guard
-};
-
-struct FlowState {
-    double x;   // spatial x-coordinate (plain double — not differentiated)
-    double y;   // spatial y-coordinate (plain double — not differentiated)
-    // nu is taken from KOmegaSSTConstants; override here if spatially varying:
-    // double nu_local = -1.0;  // if >= 0, overrides KOmegaSSTConstants::nu
-};
-
-
-class CPhysicsLoss : public CBaseLoss {
-    /*!
-     * \param flow_states  - One FlowState per collocation point.
-     * \param constants    - SST model constants (defaults: Menter 1994).
-     */
+// =====================================================================
+// PhysicsState: semantic wrapper using pre-resolved indices
+// =====================================================================
+class PhysicsState {
+private:
+    const PredictionResult& pred_;
+    const size_t* in_indices_;   
+    const size_t* out_indices_;  
 
 public:
-    explicit CPhysicsLoss(
-        const std::vector<FLowState>& flow_states,
-        const KOmegaSSTConstants& constants = {})
-          : CBaseLoss("KOmegaSSTLoss"),
-            flow_states_(flow_states),
-            constants_(constants) {}
-    /*!
-     * \brief Compute total SST physics residual at all collocation points.
-     *
-     * \param predictions  - PredictionResult at each collocation point.
-     *                       Must have outputs[0..4] = {u,v,p,k,omega},
-     *                       jacobians[iOut][iIn], hessians[iOut][iIn1][iIn2].
-     * \param ref_data     - Unused (physics loss needs no labels).
-     */
+    PhysicsState(const PredictionResult& pred,
+                 const size_t* in_idx, 
+                 const size_t* out_idx)
+        : pred_(pred), in_indices_(in_idx), out_indices_(out_idx) {}
 
-    mlpdouble Evaluate(
-        const std::vector<PredictionResult>& predictions,
-        const std::vector<std::vector<mlpdouble>>&
-    ) override {
+    mlpdouble In(size_t idx) const { return pred_.inputs[in_indices_[idx]]; }
+    mlpdouble Out(size_t idx) const { return pred_.outputs[out_indices_[idx]]; }
 
-        if (predictions.size() != flow_states_.size())
-            throw std::runtime_error(
-                "CPhysicsLoss: predictions.size() != flow_states_.size()");
-
-        ValidatePredictions(predictions);
-        
+    mlpdouble Jac(size_t out_idx, size_t in_idx) const {
+        return pred_.jacobians[out_indices_[out_idx]][in_indices_[in_idx]];
     }
 
+    mlpdouble Hess(size_t out_idx, size_t in1_idx, size_t in2_idx) const {
+        return pred_.hessians[out_indices_[out_idx]]
+                             [in_indices_[in1_idx]]
+                             [in_indices_[in2_idx]];
+    }
+};
 
+using ResidualFunction = std::function<mlpdouble(const PhysicsState&)>;
 
-
+// =====================================================================
+// CPhysicsLoss
+// =====================================================================
+class CPhysicsLoss : public CBaseLoss {
 private:
-    std::vector<FlowState> flow_states_;
-    KOmegaSSTConstants constants_;
+    ResidualFunction residual_fn_;
 
-    static void ValidatePredictions(const std::vector<PredictionResult>& preds)
-    {
-        for (std::size_t i = 0; i < preds.size(); ++i) {
-            if (preds[i].outputs.size() != N_OUTPUTS)
-                throw std::runtime_error(
-                    "CPhysicsLoss: outputs must have 5 entries [u,v,p,k,omega]");
-            if (preds[i].jacobians.size() != N_OUTPUTS)
-                throw std::runtime_error(
-                    "CPhysicsLoss: jacobians must have 5 rows");
-            for (auto& row : preds[i].jacobians)
-                if (row.size() != N_INPUTS)
-                    throw std::runtime_error(
-                        "CPhysicsLoss: each jacobian row must have 2 entries [dx,dy]");
-            if (preds[i].hessians.size() != N_OUTPUTS)
-                throw std::runtime_error(
-                    "CPhysicsLoss: hessians must have 5 blocks");
+    // Pre-resolved index arrays
+    std::vector<size_t> in_indices_;
+    std::vector<size_t> out_indices_;
+
+    static size_t resolve_name(const std::string& name,
+                               const std::vector<std::string>& names,
+                               const char* var_type) {
+        auto it = std::find(names.begin(), names.end(), name);
+        if (it == names.end()) {
+            throw std::runtime_error(
+                std::string("CPhysicsLoss: ") + var_type + " '" + name + "' not found.");
         }
+        return static_cast<size_t>(std::distance(names.begin(), it));
+    }
+
+public:
+    CPhysicsLoss(const std::string& name, ResidualFunction fn,
+                 const std::vector<std::string>& eq_in_names,
+                 const std::vector<std::string>& eq_out_names,
+                 const std::vector<std::string>& net_in_names,
+                 const std::vector<std::string>& net_out_names)
+        : CBaseLoss(name), residual_fn_(std::move(fn))
+    {
+        // Resolve ALL names to indices ONCE. 
+        in_indices_.resize(eq_in_names.size());
+        for (size_t i = 0; i < eq_in_names.size(); ++i)
+            in_indices_[i] = resolve_name(eq_in_names[i], net_in_names, "Input");
+
+        out_indices_.resize(eq_out_names.size());
+        for (size_t i = 0; i < eq_out_names.size(); ++i)
+            out_indices_[i] = resolve_name(eq_out_names[i], net_out_names, "Output");
+    }
+
+    mlpdouble Evaluate(
+        const std::vector<PredictionResult>& preds,
+        const std::vector<std::vector<mlpdouble>>& /*ref_data*/
+    ) override {
+        mlpdouble total_loss = 0.0;
+        const size_t N = preds.size();
+
+        if (N == 0) { last_loss_value_ = 0.0; return mlpdouble(0.0); }
+
+        for (const auto& pred : preds) {
+            PhysicsState state(pred, in_indices_.data(), out_indices_.data());
+
+            mlpdouble res = residual_fn_(state);
+            
+            total_loss += res * res;
+        }
+
+        // Safe cast from size_t to mlpdouble
+        mlpdouble mse = total_loss / mlpdouble(static_cast<double>(N));
+        last_loss_value_ = to_double(mse);
+        return mse;
     }
 };
 
