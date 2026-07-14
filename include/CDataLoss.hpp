@@ -43,7 +43,6 @@ public:
 
         mlpdouble loss = mse / static_cast<mlpdouble>(N * n_outputs);
         
-        // FIX 2: Use to_double instead of .getValue()
         last_loss_value_ = to_double(loss); 
         return loss;
     }
