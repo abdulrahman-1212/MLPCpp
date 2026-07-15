@@ -2,6 +2,7 @@
  * \file CPhysicsLoss.hpp
  * \brief Generic physics-residual (PDE constraint) loss for PINN training.
  *
+*/
 
 #pragma once
 
@@ -15,8 +16,9 @@
 namespace MLPToolbox {
 
 // =====================================================================
-// PhysicsState — semantic accessor over one PredictionResult, using
-// indices pre-resolved once at CPhysicsLoss construction time // =====================================================================
+// PhysicsState - semantic accessor over one PredictionResult, using
+// indices pre-resolved once at CPhysicsLoss construction time 
+// =====================================================================
 class PhysicsState {
 public:
     PhysicsState(const PredictionResult& pred,
@@ -48,7 +50,7 @@ private:
  * \brief One residual value per governing equation, evaluated at a
  *        single collocation point.
  *
- * Return the RAW residual for each equation — do NOT pre-square or
+ * Return the RAW residual for each equation - do NOT pre-square or
  * pre-combine them. CPhysicsLoss squares and sums every element
  *
  * Example (2-equation system: continuity + one momentum component):
@@ -83,7 +85,7 @@ public:
      *                       derivatives). Set false for purely algebraic
      *                       constraints (e.g. p >= 0) to skip Jacobian
      *                       computation for this loss entirely.
-     * \param needs_hessian  Whether fn calls Hess(). Default false —
+     * \param needs_hessian  Whether fn calls Hess(). Default false -
      *                       most physics losses only need first order.
      */
     CPhysicsLoss(const std::string&               name,
@@ -156,7 +158,7 @@ public:
                                static_cast<double>(n_equations_);
         mlpdouble mse = total_loss / mlpdouble(denom_d);
 
-        last_loss_value_ = mlp_to_double(mse);
+        last_loss_value_ = to_double(mse);
         return mse;
     }
 
