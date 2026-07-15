@@ -44,6 +44,9 @@ private:
     const PredictionResult& pred_;
     const size_t*           in_indices_;
     const size_t*           out_indices_;
+
+// ref physics state
+
 };
 
 /*!
@@ -154,8 +157,8 @@ public:
         }
 
         // Denominator built from doubles first (size_t overflow guard).
-        const double denom_d = static_cast<double>(N) *
-                               static_cast<double>(n_equations_);
+        // note about type conversion
+        const int denom_d = N * n_equations;
         mlpdouble mse = total_loss / mlpdouble(denom_d);
 
         last_loss_value_ = to_double(mse);

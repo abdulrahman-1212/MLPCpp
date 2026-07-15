@@ -28,8 +28,10 @@ inline double to_double<codi::RealReverse>(const codi::RealReverse& x) {
 struct PredictionResult {
     std::vector<mlpdouble> inputs;                                // [N_INPUTS]
     std::vector<mlpdouble> outputs;                               // [N_OUTPUTS]
-    std::vector<std::vector<mlpdouble>> jacobians;                // [N_OUTPUTS][N_INPUTS]
-    std::vector<std::vector<std::vector<mlpdouble>>> hessians;    // [N_OUTPUTS][N_INPUTS][N_INPUTS]
+    // CNeuralNetwork                   
+    mlpdouble ** output_Jacobian {nullptr}; /*!<\brief Jacobian of the network output w.r.t. the network input. */
+    mlpdouble *** output_Hessian {nullptr}; /*!<\brief Hessian of the network output w.r.t. the network input. */
+
 };  
 
 
