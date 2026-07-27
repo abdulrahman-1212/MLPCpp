@@ -25,15 +25,30 @@ inline double to_double<codi::RealReverse>(const codi::RealReverse& x) {
 }
 #endif
 
+// ============================================================================
+// PredictionResult
+// ============================================================================
 struct PredictionResult {
-    std::vector<mlpdouble> inputs;                                // [N_INPUTS]
-    std::vector<mlpdouble> outputs;                               // [N_OUTPUTS]
-    // CNeuralNetwork                   
-    mlpdouble ** output_Jacobian {nullptr}; /*!<\brief Jacobian of the network output w.r.t. the network input. */
-    mlpdouble *** output_Hessian {nullptr}; /*!<\brief Hessian of the network output w.r.t. the network input. */
+    std::vector<mlpdouble> inputs;
+    std::vector<mlpdouble> outputs;
 
-};  
-
+    // Non-owning views into external derivative buffers.
+    //
+    // Layout: input-major (matches CNeuralNetwork internal storage)
+    //   jacobian[input_index][output_index]     = d(output_o)/d(input_i)
+    //   hessian[input_i][input_j][output_index] = d²(output_o)/d(input_i)d(input_j)
+    //
+    // Argument order in accessors matches this layout:
+    //   Jac(input, output)              -> jacobian[input][output]
+    //   Hess(input_i, input_j, output)  -> hessian[input_i][input_j][output]
+    //
+    // LIFETIME: These pointers are valid only as long as the provider's
+    // buffer remains unchanged. For CPointDerivatives, they are invalidated
+    // by the next Fill() call. Do NOT copy PredictionResult and use
+    // derivatives after Fill() is called again.
+    mlpdouble**  jacobian{nullptr};
+    mlpdouble*** hessian{nullptr};
+};
 
 //  CBaseLoss
 class CBaseLoss {
