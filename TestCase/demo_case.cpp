@@ -1,121 +1,125 @@
 /*!
  * \file demo_case.cpp
- * \brief Integration test: train CNeuralNetwork on spiral data with a
- *        physics loss using CoDiPack reverse-mode AD.
+ * \brief Integration test: train CNeuralNetwork on reference data with
+ *        a physics loss using the CMLPTrainer and CPhysicsLoss APIs.
  *
- * Physics loss: enforce dy/du = 0 at the origin (u=0, v=0),
- * i.e. the network's first input-Jacobian should be zero there.
- * L_phys = (dy/du)^2
- * 
- * =========
- * How to run:
- * =========
- * for now, I added the test case to unit tests but may separate them in the future when I create other test cases
- * 
- * from MLPCpp dir write these commands:
- * ```
- * mkdir build && cd build
- * cmake ..
- * make test_demo_case
- * cd ../TestCase
- * ../build/UnitTests/test_demo_case
- * 
- * ```
- * ensure codi correct path at UnitTest/CMakeLists.txt
- * if you are using MLPCpp from SU2 (as a standalone project), you do not need to do anything
- * just checkout to the feature/demo_case_and_losses_implementation
- * 
+ * Physics constraint:
+ *     dy/du = 0  at collocation points
+ *
+ * The trainer handles:
+ *   - CoDiPack reverse-mode AD
+ *   - data loss
+ *   - physics loss (mini-batched)
+ *   - physics derivative evaluation
+ *   - gradient extraction
+ *   - gradient annealing
+ *   - Adam optimization
  */
 
 #define MLP_CUSTOM_TYPE codi::RealReverse
 #include "codi.hpp"
 
-#include <iostream>
-#include <vector>
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <string>
-#include <cmath>
-#include <algorithm>
-#include <numeric>
-#include <cassert>
-#include <iomanip>
+#include <vector>
 
 #include "CNeuralNetwork.hpp"
 #include "CAdam.hpp"
 #include "CGradientAnnealer.hpp"
-#include "variable_def.hpp"   // mlpdouble = codi::RealReverse (macro defined above)
+#include "CMLPTrainer.hpp"
+#include "CPhysicsLoss.hpp"
+#include "CDataLoss.hpp"
+#include "variable_def.hpp"
 
 using namespace MLPToolbox;
-using Tape = codi::RealReverse::Tape;
 
-
-//  CSV reader (returns raw double)
-static std::vector<std::vector<double>> readCSV(const std::string& filename)
-{
+// ============================================================================
+// CSV reader
+// ============================================================================
+static std::vector<std::vector<double>> readCSV(const std::string& filename) {
     std::vector<std::vector<double>> data;
     std::ifstream file(filename);
+
     if (!file.is_open()) {
         std::cerr << "ERROR: Cannot open " << filename << "\n";
-        std::exit(1);
+        return data;
     }
+
     std::string line;
-    std::getline(file, line);           // skip header
+    if (!std::getline(file, line)) return data; // Skip header
+
     while (std::getline(file, line)) {
+        if (line.empty()) continue;
         std::stringstream ss(line);
         std::vector<double> row;
         std::string cell;
-        while (std::getline(ss, cell, '\t'))
-            row.push_back(std::stod(cell));
+        while (std::getline(ss, cell, '\t')) {
+            if (!cell.empty()) row.push_back(std::stod(cell));
+        }
         if (row.size() == 3) data.push_back(row);
     }
     return data;
 }
 
-
+// ============================================================================
+// Main
+// ============================================================================
 int main() {
-    // Load data as plain double
+    // =========================================================================
+    // 1. Load reference data
+    // =========================================================================
     std::cout << "Loading reference data...\n";
-    auto rawData = readCSV("reference_data.csv");
-    if (rawData.empty()) { std::cerr << "ERROR: empty dataset\n"; return 1; }
-
+    const auto rawData = readCSV("reference_data.csv");
+    if (rawData.empty()) {
+        std::cerr << "ERROR: Empty dataset.\n";
+        return 1;
+    }
     const std::size_t N = rawData.size();
-    std::cout << "Loaded " << N << " data points\n";
+    std::cout << "Loaded " << N << " data points.\n";
 
-    double u_min =  1e9, u_max = -1e9;
-    double v_min =  1e9, v_max = -1e9;
-    double y_min =  1e9, y_max = -1e9;
+    // =========================================================================
+    // 2. Compute data ranges
+    // =========================================================================
+    double u_min = 1e9, u_max = -1e9;
+    double v_min = 1e9, v_max = -1e9;
+    double y_min = 1e9, y_max = -1e9;
 
     std::vector<double> u_raw(N), v_raw(N), y_raw(N);
     for (std::size_t i = 0; i < N; ++i) {
         u_raw[i] = rawData[i][0];
         v_raw[i] = rawData[i][1];
         y_raw[i] = rawData[i][2];
+
         u_min = std::min(u_min, u_raw[i]); u_max = std::max(u_max, u_raw[i]);
         v_min = std::min(v_min, v_raw[i]); v_max = std::max(v_max, v_raw[i]);
         y_min = std::min(y_min, y_raw[i]); y_max = std::max(y_max, y_raw[i]);
     }
 
-    assert(u_max > u_min && "u range is degenerate");
-    assert(v_max > v_min && "v range is degenerate");
-    assert(y_max > y_min && "y range is degenerate");
+    assert(u_max > u_min && v_max > v_min && y_max > y_min);
 
-    std::cout << "u range: [" << u_min << ", " << u_max << "]\n";
-    std::cout << "v range: [" << v_min << ", " << v_max << "]\n";
-    std::cout << "y range: [" << y_min << ", " << y_max << "]\n\n";
-
-    // build mlpdouble dataset (codi::RealReverse, passive values)
+    // =========================================================================
+    // 3. Convert dataset to mlpdouble
+    // =========================================================================
     std::vector<std::vector<mlpdouble>> X(N, std::vector<mlpdouble>(2));
-    std::vector<mlpdouble> y(N);
-    for (std::size_t i = 0; i < N; i++){
+    std::vector<std::vector<mlpdouble>> Y(N, std::vector<mlpdouble>(1));
+    for (std::size_t i = 0; i < N; ++i) {
         X[i][0] = mlpdouble(u_raw[i]);
         X[i][1] = mlpdouble(v_raw[i]);
-        y[i] = mlpdouble(y_raw[i]);
+        Y[i][0] = mlpdouble(y_raw[i]);
     }
 
-    // build NN
-    std::vector<size_t> arch = {2, 16, 16, 1};
-    CNeuralNetwork net(arch);
+    // =========================================================================
+    // 4. Build neural network
+    // =========================================================================
+    std::vector<std::size_t> architecture = {2, 16, 16, 1};
+    CNeuralNetwork net(architecture);
     net.SetActivationFunction("tanh");
 
     net.SetInputRegularization("minmax");
@@ -132,169 +136,144 @@ int main() {
     net.RandomWeights();
     net.DisplayNetwork();
 
-    // Optimizer and Annealer
+    // =========================================================================
+    // 5. Create physics loss
+    // =========================================================================
+    CPhysicsEquation eq;
+    eq.name = "dy_du_eq";
+    eq.input_names = {"u"};
+    eq.output_names = {"y"};
+    eq.weight = 1.0;
+    eq.requires_jacobian = true;
+    eq.requires_hessian = false;
+    eq.residual = [](const PhysicsState& state, const PhysicsData& /*data*/) -> mlpdouble {
+        // Residual: dy/du (which should be 0)
+        return state.EquationJac(0, 0);
+    };
+
+    auto physics_loss = std::make_shared<CPhysicsLoss>(
+        "dy_du_zero",
+        net.GetInputVars(),
+        net.GetOutputVars(),
+        std::vector<std::string>{},
+        std::vector<CPhysicsEquation>{eq}
+    );
+
+    // =========================================================================
+    // 6. Create optimizer
+    // =========================================================================
     CAdam optimizer(1e-3, 0.9, 0.999, 1e-8);
 
+    // =========================================================================
+    // 7. Configure gradient annealing
+    // =========================================================================
     AnnealerConfig anneal_cfg;
-    anneal_cfg.n_data_terms = 1;   // one data-fit term (MSE)
+    anneal_cfg.n_data_terms = 1;
     anneal_cfg.alpha        = 0.9;
     anneal_cfg.lambda_init  = 1.0;
     anneal_cfg.lambda_min   = 1e-4;
     anneal_cfg.lambda_max   = 10.0;
-    CGradientAnnealer annealer(anneal_cfg);
 
+    // =========================================================================
+    // 8. Configure trainer (WITH PHYSICS MINI-BATCHING)
+    // =========================================================================
+    TrainerConfig trainer_cfg;
+    trainer_cfg.max_epochs         = 80;
+    trainer_cfg.batch_size         = N;    // Full-batch supervised training
+    trainer_cfg.physics_batch_size = 4;    // NEW: Sample 4 physics points per step
+    trainer_cfg.conv_tol_abs       = 1e-8;
+    trainer_cfg.conv_tol_rel       = 1e-6;
+    trainer_cfg.use_annealer       = true;
+    trainer_cfg.verbose            = true;
+    trainer_cfg.log_every          = 10;
+    trainer_cfg.shuffle_per_epoch  = true;
 
-    // computing loss
-    // 1. data loss (mse)
-    // w_reg: weights that are already on the tape
-    auto compute_data_loss = [&](const std::vector<mlpdouble>& w_reg) -> mlpdouble {
-        net.SetWeightsBiases(w_reg);
+    // =========================================================================
+    // 9. Construct trainer
+    // =========================================================================
+    CMLPTrainer trainer(net, std::move(optimizer), anneal_cfg, trainer_cfg);
 
-        mlpdouble mse = mlpdouble(0.0);
-        for (std::size_t i = 0; i < N; i++){
-            net.Predict(X[i]);
-            mlpdouble error = net.GetOutput(0) - y[i];
-            mse += (error * error);
-        }
+    // =========================================================================
+    // 10. Set reference data
+    // =========================================================================
+    trainer.SetTrainingData(X, Y);
 
-        return mse / mlpdouble(static_cast<double>(N));
-    };
+    // =========================================================================
+    // 11. Register physics collocation set (Multiple points for batching)
+    // =========================================================================
+    std::vector<std::vector<mlpdouble>> physics_points;
+    // Generate 20 collocation points near the origin
+    for (int i = 0; i < 20; ++i) {
+        double offset = static_cast<double>(i) * 0.01;
+        physics_points.push_back({mlpdouble(offset), mlpdouble(offset)});
+    }
+    trainer.SetCollocationPoints("colloc", physics_points);
 
+    // =========================================================================
+    // 12. Register physics loss with trainer
+    // =========================================================================
+    trainer.AddPhysicsLoss(physics_loss, "colloc");
 
-    auto compute_phys_loss = [&](const std::vector<mlpdouble>& w_reg) -> mlpdouble {
-        net.SetWeightsBiases(w_reg);
+    // =========================================================================
+    // 13. Build trainer
+    // =========================================================================
+    trainer.Build();
 
-        std::vector<mlpdouble> x_col = {
-            mlpdouble(0.0),
-            mlpdouble(0.0)
-        };
-
-        net.Predict(x_col, true, false);
-        mlpdouble dydu = net.GetJacobian(0, 0);
-        return dydu * dydu;
-    };
-
-
-    // training loop
-    const unsigned int epochs = 80;
-    std::cout << "Starting training (" << epochs << " epochs)...\n\n";
+    // =========================================================================
+    // 14. Train
+    // =========================================================================
+    std::cout << "\nStarting training (" << trainer_cfg.max_epochs << " epochs)...\n";
+    std::cout << "Physics mini-batch size: " << trainer_cfg.physics_batch_size << "\n\n";
+    
     std::cout << std::left
               << std::setw(8)  << "Epoch"
               << std::setw(16) << "L_data"
               << std::setw(16) << "L_phys"
               << std::setw(12) << "lambda"
-              << std::setw(12) << "L_total"
-              << "\n"
-              << std::string(64, '-') << "\n";
+              << std::setw(16) << "L_total"
+              << "\n";
+    std::cout << std::string(68, '-') << "\n";
 
-    Tape& tape = codi::RealReverse::getTape();
-    for (unsigned int epoch = 0; epoch < epochs; epoch++){
-        std::vector<double> g_data, g_phys;
-        double val_data_loss, val_phys_loss;
+    for (std::size_t epoch = 0; epoch < trainer_cfg.max_epochs; ++epoch) {
+        trainer.TrainEpoch();
+        const TrainStepResult& result = trainer.GetLastResult();
 
-        // data loss
-        {
-            tape.reset();
-            tape.setActive();
-
-            std::vector<mlpdouble> w = net.GetWeightsBiases();
-            for(auto& wi: w) tape.registerInput(wi);
-            
-            mlpdouble L_data = compute_data_loss(w);
-            tape.registerOutput(L_data);
-            tape.setPassive();
-
-            val_data_loss = L_data.getValue();
-
-            L_data.setGradient(1.0);
-            tape.evaluate();
-
-            g_data.resize(w.size());
-            for (std::size_t i = 0; i < w.size(); i++)
-                g_data[i] = w[i].getGradient();
-            
-            tape.reset();
-
-        }
-
-        // physics loss
-
-        {
-
-            tape.setActive();
-            std::vector<mlpdouble> w = net.GetWeightsBiases();
-            for (auto& wi: w) tape.registerInput(wi);
-
-            mlpdouble L_phys = compute_phys_loss(w);
-            tape.registerOutput(L_phys);
-            tape.setPassive();
-
-            val_phys_loss = L_phys.getValue();
-
-            L_phys.setGradient(1.0);
-            tape.evaluate();
-
-            g_phys.resize(w.size());
-            for (std::size_t i = 0; i < w.size(); i++)
-                g_phys[i] = w[i].getGradient();
-
-            tape.reset();
-
-        }
-
-        // anealer update step
-        GradStats stats_phys = GradStats::from_grads(g_phys);
-        GradStats stats_data = GradStats::from_grads(g_data);
-
-        annealer.update(stats_phys, {stats_data});
-        double lambda = annealer.get_lambda(0);
-
-        const std::size_t n = g_data.size();
-        std::vector<mlpdouble> g_total(n);
-
-        for (std::size_t i = 0; i < n; i++)
-            g_total[i] = mlpdouble(g_phys[i] + lambda * g_data[i]);
-        
-        std::vector<mlpdouble> w_curr = net.GetWeightsBiases();
-        optimizer.step(w_curr, g_total);
-        net.SetWeightsBiases(w_curr);
-
-        if (epoch % 10 == 0) {
-            double L_total = val_phys_loss + lambda * val_data_loss;
-            double lr = static_cast<double>(optimizer.getLearningRate().getValue());
+        if (epoch % 10 == 0 || epoch == trainer_cfg.max_epochs - 1) {
+            const double lambda = result.lambdas.empty() ? 1.0 : result.lambdas[0];
             std::cout << std::left
-                      << std::setw(8)  << epoch
-                      << std::setw(16) << std::scientific << std::setprecision(4)
-                                       << val_data_loss
-                      << std::setw(16) << val_phys_loss
+                      << std::setw(8) << (epoch + 1)
+                      << std::setw(16) << std::scientific << std::setprecision(4) << result.loss_ref
+                      << std::setw(16) << result.loss_phys[0]
                       << std::setw(12) << std::fixed << std::setprecision(4) << lambda
-                      << std::setw(12) << std::scientific << L_total
+                      << std::setw(16) << std::scientific << std::setprecision(4) << result.loss_total
                       << "\n";
         }
     }
 
+    // =========================================================================
+    // 15. Final training result
+    // =========================================================================
+    const TrainStepResult& final_result = trainer.GetLastResult();
     std::cout << "\nTraining complete.\n";
+    std::cout << "Final reference loss: " << std::scientific << final_result.loss_ref << "\n";
+    std::cout << "Final physics loss:   " << final_result.loss_phys[0] << "\n";
+    std::cout << "Final total loss:     " << final_result.loss_total << "\n";
 
-    {
-        tape.reset();
-        tape.setActive();
-        auto w = net.GetWeightsBiases();
-        for (auto& wi : w) tape.registerInput(wi);
-        mlpdouble L_final = mlpdouble(0.0);
-        for (std::size_t i = 0; i < N; ++i) {
-            net.SetWeightsBiases(w);
-            net.Predict(X[i]);
-            mlpdouble diff = net.GetOutput(0) - y[i];
-            L_final = L_final + diff * diff;
-        }
-        L_final = L_final / mlpdouble(static_cast<double>(N));
-        tape.reset();
-        std::cout << "Final data loss (MSE): " << L_final.getValue() << "\n";
-    }
+    // =========================================================================
+    // 16. Explicitly evaluate the final physics condition
+    // =========================================================================
+    std::vector<mlpdouble> origin = {mlpdouble(0.0), mlpdouble(0.0)};
+    net.Predict(origin, true, false);
+    const double dy_du = static_cast<double>(net.GetJacobian(0, 0).getValue());
 
+    std::cout << "\nPhysics diagnostic at origin:\n";
+    std::cout << "dy/du = " << std::scientific << dy_du << "\n";
+
+    // =========================================================================
+    // 17. Save trained network
+    // =========================================================================
     net.WriteNeuralNetwork("trained_model_ad.mlp");
     std::cout << "Model saved to trained_model_ad.mlp\n";
 
     return 0;
-
 }
