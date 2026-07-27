@@ -118,7 +118,7 @@ int main() {
     // =========================================================================
     // 4. Build neural network
     // =========================================================================
-    std::vector<std::size_t> architecture = {2, 16, 16, 1};
+    std::vector<std::size_t> architecture = {2, 32, 32, 1};
     CNeuralNetwork net(architecture);
     net.SetActivationFunction("tanh");
 
@@ -162,7 +162,7 @@ int main() {
     // =========================================================================
     // 6. Create optimizer
     // =========================================================================
-    CAdam optimizer(1e-3, 0.9, 0.999, 1e-8);
+    CAdam optimizer(2e-4, 0.9, 0.999, 1e-8);
 
     // =========================================================================
     // 7. Configure gradient annealing
@@ -172,7 +172,7 @@ int main() {
     anneal_cfg.alpha        = 0.9;
     anneal_cfg.lambda_init  = 1.0;
     anneal_cfg.lambda_min   = 1e-4;
-    anneal_cfg.lambda_max   =0;
+    anneal_cfg.lambda_max   = 1e10;
 
     // =========================================================================
     // 8. Configure trainer
@@ -180,7 +180,7 @@ int main() {
     TrainerConfig trainer_cfg;
     trainer_cfg.max_epochs         = 200;
     trainer_cfg.batch_size         = 512;    
-    trainer_cfg.physics_batch_size = 4;    
+    trainer_cfg.physics_batch_size = 0;    
     trainer_cfg.conv_tol_abs       = 1e-8;
     trainer_cfg.conv_tol_rel       = 1e-6;
     trainer_cfg.use_annealer       = true;
