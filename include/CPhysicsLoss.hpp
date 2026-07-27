@@ -1,57 +1,4 @@
-/*!
- * \file CPhysicsLoss.hpp
- * \brief Physics-informed loss with canonical per-point residual evaluation.
- *
- * Design:
- *   EvaluateOne()
- *       -> evaluates residuals for exactly one PredictionResult
- *       -> returns raw weighted sum of squared residuals
- *       -> const: no side effects, safe for streaming use
- *
- *   Evaluate()
- *       -> calls EvaluateOne() for every point
- *       -> returns normalized mean squared residual
- *       -> updates last_loss_value_
- *
- * Per-equation PhysicsState:
- *   Each equation's residual receives a PhysicsState constructed with that
- *   equation's own resolved index vectors. EquationIn/EquationOut/EquationJac/
- *   EquationHess map local indices (0,1,2,...) to the correct network-level
- *   indices without ambiguity.
- *
- * PredictionResult:
- *   - inputs / outputs are owning vectors
- *   - jacobian / hessian are non-owning views
- *
- * LAYOUT CONVENTION (input-major, matching CNeuralNetwork):
- *   jacobian[input_index][output_index]     = d(output_o)/d(input_i)
- *   hessian[input_i][input_j][output_index] = d^2(output_o)/d(input_i)d(input_j)
- *
- *   Argument order in PhysicsState accessors matches array layout:
- *     Jac(input, output)              -> jacobian[input][output]
- *     Hess(input_i, input_j, output)  -> hessian[input_i][input_j][output]
- *
- *   CPointDerivatives::Fill() populates buffers in this exact input-major
- *   layout, matching the network's native storage — no transposition needed.
- *
- * Derivative requirement contract:
- *   requires_jacobian / requires_hessian are aggregated from each equation's
- *   declared flags. The trainer uses these to decide whether to compute and
- *   allocate derivative buffers. If an equation's residual calls EquationJac()
- *   but the equation declares requires_jacobian = false, the trainer may skip
- *   Jacobian allocation, and the residual will fail at runtime with a null-
- *   pointer error. Equations MUST declare these flags truthfully.
- *
- * Weight semantics:
- *   loss contribution for equation e is: weight_e * r_e^2
- *   The weight scales the squared residual linearly.
- *
- * mlpdouble is expected to be an AD-enabled scalar such as
- * codi::RealReverse during training.
- */
-
 #pragma once
-
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -67,30 +14,26 @@
 
 namespace MLPToolbox {
 
+// Forward declarations
+class PhysicsData;
+class PhysicsState;
+
+// Now safe to define
+using ResidualFunction = std::function<mlpdouble(const PhysicsState&, const PhysicsData&)>;
 
 // ============================================================================
 // PhysicsData
-// Owns per-point auxiliary physics data.
-//
-// Example:
-//   values = {1.0, 3.5}
-//   names  = {"rho", "source"}
-//
-// NOTE: Argument order is (values, names) to match the Knowledge Base.
-//       Most codebases use (names, values); this order is intentional.
 // ============================================================================
 class PhysicsData {
 public:
     PhysicsData(std::vector<mlpdouble> values, std::vector<std::string> names)
         : values_(std::move(values)), names_(std::move(names)) {
-
         if (names_.size() != values_.size()) {
             throw std::invalid_argument(
                 "PhysicsData: names and values must have identical sizes. " +
                 std::string("names=") + std::to_string(names_.size()) +
                 ", values=" + std::to_string(values_.size()));
         }
-
         for (std::size_t i = 0; i < names_.size(); ++i) {
             if (names_[i].empty()) {
                 throw std::invalid_argument("PhysicsData: physics variable name cannot be empty.");
@@ -135,14 +78,6 @@ private:
 
 // ============================================================================
 // PhysicsState
-// Provides named access to network inputs, outputs, Jacobian, and Hessian.
-// Constructed per-equation with that equation's resolved input/output indices.
-//
-// Accessor argument order matches array layout (input-major):
-//   Jac(input, output)              -> jacobian[input][output]
-//   Hess(input_i, input_j, output)  -> hessian[input_i][input_j][output]
-//   EquationJac(eq_input, eq_output)          -> Jac(mapped_input, mapped_output)
-//   EquationHess(eq_input_i, eq_input_j, eq_output) -> Hess(mapped_...)
 // ============================================================================
 class PhysicsState {
 public:
@@ -155,7 +90,6 @@ public:
           equation_output_indices_(equation_output_indices),
           n_network_inputs_(n_network_inputs),
           n_network_outputs_(n_network_outputs) {
-
         if (pred_.inputs.size() != n_network_inputs_) {
             throw std::invalid_argument(
                 "PhysicsState: PredictionResult input dimension mismatch. " +
@@ -169,9 +103,6 @@ public:
                 ", got=" + std::to_string(pred_.outputs.size()));
         }
     }
-
-    // --- Network-level access (absolute indices) ---
-    // Argument order: input first, then output — matches array layout.
 
     mlpdouble In(std::size_t network_input_index) const {
         if (network_input_index >= pred_.inputs.size()) {
@@ -187,7 +118,6 @@ public:
         return pred_.outputs[network_output_index];
     }
 
-    // jacobian[input_index][output_index]
     mlpdouble Jac(std::size_t input_index, std::size_t output_index) const {
         if (input_index >= pred_.inputs.size())  throw std::out_of_range("PhysicsState::Jac: input index out of range.");
         if (output_index >= pred_.outputs.size()) throw std::out_of_range("PhysicsState::Jac: output index out of range.");
@@ -195,16 +125,12 @@ public:
         return pred_.jacobian[input_index][output_index];
     }
 
-    // hessian[input_i][input_j][output_index]
     mlpdouble Hess(std::size_t input_i, std::size_t input_j, std::size_t output_index) const {
         if (input_i >= pred_.inputs.size() || input_j >= pred_.inputs.size()) throw std::out_of_range("PhysicsState::Hess: input index out of range.");
         if (output_index >= pred_.outputs.size())                             throw std::out_of_range("PhysicsState::Hess: output index out of range.");
         if (pred_.hessian == nullptr)                                         throw std::runtime_error("PhysicsState::Hess: Hessian was not provided by PredictionResult.");
         return pred_.hessian[input_i][input_j][output_index];
     }
-
-    // --- Equation-specific access (local indices, pre-resolved) ---
-    // Argument order: equation-input first, then equation-output — matches Jac/Hess.
 
     mlpdouble EquationIn(std::size_t equation_input_index) const {
         if (equation_input_index >= equation_input_indices_.size()) throw std::out_of_range("PhysicsState::EquationIn: index out of range.");
@@ -216,21 +142,17 @@ public:
         return Out(equation_output_indices_[equation_output_index]);
     }
 
-    // EquationJac(eq_input, eq_output) -> Jac(mapped_input, mapped_output)
     mlpdouble EquationJac(std::size_t equation_input_index, std::size_t equation_output_index) const {
         if (equation_input_index >= equation_input_indices_.size())  throw std::out_of_range("PhysicsState::EquationJac: input index out of range.");
         if (equation_output_index >= equation_output_indices_.size()) throw std::out_of_range("PhysicsState::EquationJac: output index out of range.");
         return Jac(equation_input_indices_[equation_input_index], equation_output_indices_[equation_output_index]);
     }
 
-    // EquationHess(eq_input_i, eq_input_j, eq_output) -> Hess(mapped_i, mapped_j, mapped_output)
     mlpdouble EquationHess(std::size_t equation_input_i, std::size_t equation_input_j, std::size_t equation_output_index) const {
         if (equation_input_i >= equation_input_indices_.size() || equation_input_j >= equation_input_indices_.size()) throw std::out_of_range("PhysicsState::EquationHess: input index out of range.");
         if (equation_output_index >= equation_output_indices_.size()) throw std::out_of_range("PhysicsState::EquationHess: output index out of range.");
         return Hess(equation_input_indices_[equation_input_i], equation_input_indices_[equation_input_j], equation_output_indices_[equation_output_index]);
     }
-
-    // --- Query helpers ---
 
     std::size_t NumEquationInputs()  const noexcept { return equation_input_indices_.size(); }
     std::size_t NumEquationOutputs() const noexcept { return equation_output_indices_.size(); }
@@ -247,33 +169,14 @@ private:
 
 // ============================================================================
 // CPhysicsEquation
-// One PDE / ODE / algebraic residual equation.
-//
-// The residual callback must return: r(x)
-// The loss contribution is: weight * r^2   
-//
-// Derivative requirement contract:
-//   requires_jacobian must be true if the residual calls Jac or EquationJac.
-//   requires_hessian  must be true if the residual calls Hess or EquationHess.
-//   If a flag is false but the residual still calls the accessor, and no
-//   other equation requires that derivative, the trainer will not allocate
-//   the derivative buffer. The accessor will then throw a null-pointer
-//   error at runtime. Equations MUST declare these flags truthfully.
-//
-// Weight semantics:
-//   weight must be >= 0. A weight of 0.0 disables the equation's loss
-//   contribution but it is still counted in the normalization denominator
-//   (N_eq). To fully remove an equation, omit it from the equations vector.
 // ============================================================================
 struct CPhysicsEquation {
-    using ResidualFunction = std::function<mlpdouble(const PhysicsState&, const PhysicsData&)>;
-
     std::string name;
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
-    double weight{1.0};                  // Linear scaling of squared residual: weight * r^2
-    bool requires_jacobian{false};       // MUST be true if residual uses Jac/EquationJac
-    bool requires_hessian{false};        // MUST be true if residual uses Hess/EquationHess
+    double weight{1.0};                  
+    bool requires_jacobian{false};       
+    bool requires_hessian{false};        
     ResidualFunction residual;
 };
 
@@ -292,7 +195,6 @@ public:
           network_output_names_(std::move(network_output_names)),
           physics_variable_names_(std::move(physics_variable_names)),
           equations_(std::move(equations)) {
-
         if (name_.empty()) throw std::invalid_argument("CPhysicsLoss: loss name cannot be empty.");
         if (equations_.empty()) throw std::invalid_argument("CPhysicsLoss: at least one equation is required.");
 
@@ -303,8 +205,6 @@ public:
         ValidateEquationWeights();
         DetermineDerivativeRequirements();
     }
-
-    // --- Observers ---
 
     std::size_t NumEquations() const noexcept { return equations_.size(); }
     std::size_t NumPhysicsVariables() const noexcept { return physics_variable_names_.size(); }
@@ -320,16 +220,9 @@ public:
         return equations_[index];
     }
 
-    // --- EvaluateOne ---
-    // Returns sum_e weight_e * r_e^2. NO normalization.
-    // This is the canonical streaming primitive used by the trainer.
-    // Each equation receives its own PhysicsState with that equation's
-    // resolved index mapping, so EquationIn/EquationOut/EquationJac/
-    // EquationHess correctly map local indices to network-level indices.
     mlpdouble EvaluateOne(const PredictionResult& pred,
                            const std::vector<mlpdouble>& physics_data = {}) const {
         ValidatePrediction(pred);
-
         if (physics_data.size() != physics_variable_names_.size()) {
             throw std::invalid_argument(
                 "CPhysicsLoss '" + name_ + "': physics data size mismatch. Expected " +
@@ -337,9 +230,7 @@ public:
                 std::to_string(physics_data.size()));
         }
 
-        // NOTE: (values, names) argument order matches Knowledge Base convention.
         PhysicsData data(physics_data, physics_variable_names_);
-
         mlpdouble raw_loss = mlpdouble(0.0);
         for (std::size_t e = 0; e < equations_.size(); ++e) {
             PhysicsState state(pred,
@@ -347,18 +238,13 @@ public:
                                equation_output_indices_[e],
                                network_input_names_.size(),
                                network_output_names_.size());
-
             const mlpdouble residual = equations_[e].residual(state, data);
             const double w = equations_[e].weight;
             raw_loss += mlpdouble(w) * residual * residual;
         }
-
         return raw_loss;
     }
 
-    // --- Evaluate ---
-    // Canonical normalized loss: 1 / (N * N_eq) * sum_p sum_e w_e * r_e(x_p)^2
-    // Note: N_eq counts ALL equations including those with weight=0.
     mlpdouble Evaluate(const std::vector<PredictionResult>& preds,
                        const std::vector<std::vector<mlpdouble>>& physics_data) override {
         const std::size_t N = preds.size();
@@ -366,7 +252,6 @@ public:
             last_loss_value_ = 0.0;
             return mlpdouble(0.0);
         }
-
         if (!physics_variable_names_.empty() && physics_data.size() != N) {
             throw std::invalid_argument(
                 "CPhysicsLoss '" + name_ + "': physics_data must contain exactly one row per prediction.");
@@ -390,8 +275,6 @@ public:
     }
 
 private:
-    // --- Construction validation ---
-
     void ValidateNetworkNames() {
         ValidateUniqueNames(network_input_names_, "network input");
         ValidateUniqueNames(network_output_names_, "network output");
@@ -519,18 +402,13 @@ private:
     }
 
     // --- Members ---
-
+    // NOTE: name_ is inherited from CBaseLoss and does not need to be redeclared here.
     std::vector<std::string> network_input_names_;
     std::vector<std::string> network_output_names_;
     std::vector<std::string> physics_variable_names_;
     std::vector<CPhysicsEquation> equations_;
-
-    // Per-equation resolved index vectors.
-    // equation_input_indices_[e][local_i]  -> network input index
-    // equation_output_indices_[e][local_o] -> network output index
     std::vector<std::vector<std::size_t>> equation_input_indices_;
     std::vector<std::vector<std::size_t>> equation_output_indices_;
-
     bool requires_jacobian_{false};
     bool requires_hessian_{false};
 };

@@ -14,8 +14,8 @@
 namespace MLPToolbox {   
 
 template<typename T>
-inline double to_double(const T& x) { 
-    return static_cast<double>(x); 
+inline double to_double(const T& x) {
+    return static_cast<double>(x);
 }
 
 #ifdef MLP_CUSTOM_TYPE
