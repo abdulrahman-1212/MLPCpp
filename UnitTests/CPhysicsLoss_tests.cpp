@@ -1,489 +1,727 @@
+#define MLP_CUSTOM_TYPE codi::RealReverse
+#include "codi.hpp"
+
 #define CATCH_CONFIG_MAIN
 #include "catch.hpp"
+
 #include <vector>
 #include <cmath>
 #include <stdexcept>
-#include <iostream>
 #include <string>
-#include <memory>
+
 #include "CPhysicsLoss.hpp"
 #include "CBaseLoss.hpp"
 
 using namespace MLPToolbox;
 
 // ============================================================
-// Custom Macro
+// Helpers
 // ============================================================
+
 #define REQUIRE_EQUAL_TOL(a, b, tol) \
-    REQUIRE(static_cast<double>(a) == Approx(static_cast<double>(b)).margin(tol))
+    REQUIRE(to_double(a) == Approx(to_double(b)).margin(tol))
 
-// ============================================================
-// Unit Tests – updated for new CPhysicsLoss implementation
-// ============================================================
-
-// -----------------------------------------------------------------
-// 1. n_equations == 0 throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss n_equations == 0 throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x", "t"};
-    std::vector<std::string> net_out = {"u", "p"};
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{1.0};
-    };
-
-    REQUIRE_THROWS_AS(
-        CPhysicsLoss("test", dummy_fn, 0, {"x"}, {"u"}, net_in, net_out),
-        std::invalid_argument
-    );
-}
-
-// -----------------------------------------------------------------
-// 2. sparsity flags and indices
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss sparsity flags and indices", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x", "t"};
-    std::vector<std::string> net_out = {"u", "p"};
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{1.0};
-    };
-
-    // Default flags (jac=true, hess=false)
-    CPhysicsLoss loss_default("default", dummy_fn, 1, {"t", "x"}, {"p", "u"},
-                              net_in, net_out);
-    REQUIRE(loss_default.NumEquations() == 1);
-    REQUIRE(loss_default.RequiresJacobian() == true);
-    REQUIRE(loss_default.RequiresHessian() == false);
-
-    // Algebraic (no derivatives)
-    CPhysicsLoss loss_algebraic("algebraic", dummy_fn, 1, {"x"}, {"u"},
-                                net_in, net_out, false, false);
-    REQUIRE(loss_algebraic.RequiresJacobian() == false);
-    REQUIRE(loss_algebraic.RequiresHessian() == false);
-
-    // Viscous (needs Hessian)
-    CPhysicsLoss loss_viscous("viscous", dummy_fn, 1, {"x"}, {"u"},
-                              net_in, net_out, true, true);
-    REQUIRE(loss_viscous.RequiresJacobian() == true);
-    REQUIRE(loss_viscous.RequiresHessian() == true);
-}
-
-// -----------------------------------------------------------------
-// 3. missing variable throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss missing variable throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x", "t"};
-    std::vector<std::string> net_out = {"u", "p"};
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{1.0};
-    };
-
-    // Missing input variable
-    REQUIRE_THROWS_AS(
-        CPhysicsLoss("test", dummy_fn, 1, {"z"}, {"u"}, net_in, net_out),
-        std::runtime_error
-    );
-
-    // Missing output variable
-    REQUIRE_THROWS_AS(
-        CPhysicsLoss("test", dummy_fn, 1, {"x"}, {"v"}, net_in, net_out),
-        std::runtime_error
-    );
-}
-
-// -----------------------------------------------------------------
-// 4. residual size mismatch throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss residual size mismatch throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
-    std::vector<std::string> net_out = {"u"};
-
-    // Function returns 2 residuals, but we declare n_equations = 1
-    ResidualFunction bad_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{1.0, 2.0};
-    };
-
-    // No Jacobian needed, so we can set needs_jacobian=false to avoid
-    // nullptr checks on output_Jacobian.
-    CPhysicsLoss loss("bad_size", bad_fn, 1, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    PredictionResult pred;
-    pred.inputs = {1.0};
-    pred.outputs = {1.0};
-    std::vector<PredictionResult> preds = {pred};
-    std::vector<std::vector<mlpdouble>> ref_data;
-
-    REQUIRE_THROWS_AS(loss.Evaluate(preds, ref_data), std::runtime_error);
-}
-
-// -----------------------------------------------------------------
-// 5. correct MSE computation (no RHS)
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss correct MSE computation", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
-    std::vector<std::string> net_out = {"u"};
-
-    int call_count = 0;
-    ResidualFunction math_fn = [&call_count](const PhysicsState& s) {
-        if (call_count == 0) {
-            call_count++;
-            return std::vector<mlpdouble>{2.0, 3.0}; // 2^2 + 3^2 = 13
-        } else {
-            call_count++;
-            return std::vector<mlpdouble>{1.0, 4.0}; // 1^2 + 4^2 = 17
+// Layout: jacobian[input][output]
+static mlpdouble** AllocateJacobian(std::size_t n_inputs, std::size_t n_outputs) {
+    mlpdouble** jac = new mlpdouble*[n_inputs];
+    for (std::size_t i = 0; i < n_inputs; ++i) {
+        jac[i] = new mlpdouble[n_outputs];
+        for (std::size_t o = 0; o < n_outputs; ++o) {
+            jac[i][o] = 0.0;
         }
+    }
+    return jac;
+}
+
+// Layout: hessian[input_i][input_j][output]
+static mlpdouble*** AllocateHessian(std::size_t n_inputs, std::size_t n_outputs) {
+    mlpdouble*** hess = new mlpdouble**[n_inputs];
+    for (std::size_t i = 0; i < n_inputs; ++i) {
+        hess[i] = new mlpdouble*[n_inputs];
+        for (std::size_t j = 0; j < n_inputs; ++j) {
+            hess[i][j] = new mlpdouble[n_outputs];
+            for (std::size_t o = 0; o < n_outputs; ++o) {
+                hess[i][j][o] = 0.0;
+            }
+        }
+    }
+    return hess;
+}
+
+static void FreeJacobian(mlpdouble** jac, std::size_t n_inputs) {
+    if (!jac) return;
+    for (std::size_t i = 0; i < n_inputs; ++i) delete[] jac[i];
+    delete[] jac;
+}
+
+static void FreeHessian(mlpdouble*** hess, std::size_t n_inputs) {
+    if (!hess) return;
+    for (std::size_t i = 0; i < n_inputs; ++i) {
+        for (std::size_t j = 0; j < n_inputs; ++j) delete[] hess[i][j];
+        delete[] hess[i];
+    }
+    delete[] hess;
+}
+
+static PredictionResult MakePrediction(
+    std::vector<mlpdouble> inputs,
+    std::vector<mlpdouble> outputs,
+    mlpdouble** jac = nullptr,
+    mlpdouble*** hess = nullptr)
+{
+    PredictionResult pred;
+    pred.inputs  = std::move(inputs);
+    pred.outputs = std::move(outputs);
+    pred.jacobian = jac;
+    pred.hessian  = hess;
+    return pred;
+}
+
+// ============================================================
+// CPhysicsLoss Unit Tests
+// ============================================================
+
+TEST_CASE("CPhysicsLoss empty equations throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "t"};
+    std::vector<std::string> net_out = {"u", "p"};
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("test", net_in, net_out, {}, {}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss sparsity flags", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "t"};
+    std::vector<std::string> net_out = {"u", "p"};
+    
+    CPhysicsEquation eq_algebraic;
+    eq_algebraic.name = "alg";
+    eq_algebraic.input_names  = {"x"};
+    eq_algebraic.output_names = {"u"};
+    eq_algebraic.requires_jacobian = false;
+    eq_algebraic.requires_hessian  = false;
+    eq_algebraic.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(1.0); };
+    
+    CPhysicsLoss loss_algebraic("algebraic", net_in, net_out, {}, {eq_algebraic});
+    REQUIRE(loss_algebraic.RequiresJacobian() == false);
+    REQUIRE(loss_algebraic.RequiresHessian()  == false);
+
+    CPhysicsEquation eq_jac;
+    eq_jac.name = "jac_eq";
+    eq_jac.input_names  = {"x"};
+    eq_jac.output_names = {"u"};
+    eq_jac.requires_jacobian = true;
+    eq_jac.requires_hessian  = false;
+    eq_jac.residual = [](const PhysicsState& s, const PhysicsData&) { return s.EquationJac(0, 0); };
+    
+    CPhysicsLoss loss_jac("jac_only", net_in, net_out, {}, {eq_jac});
+    REQUIRE(loss_jac.RequiresJacobian() == true);
+    REQUIRE(loss_jac.RequiresHessian()  == false);
+
+    CPhysicsEquation eq_hess;
+    eq_hess.name = "hess_eq";
+    eq_hess.input_names  = {"x"};
+    eq_hess.output_names = {"u"};
+    eq_hess.requires_jacobian = true;
+    eq_hess.requires_hessian  = true;
+    eq_hess.residual = [](const PhysicsState& s, const PhysicsData&) { return s.EquationHess(0, 0, 0); };
+    
+    CPhysicsLoss loss_hess("hess_full", net_in, net_out, {}, {eq_hess});
+    REQUIRE(loss_hess.RequiresJacobian() == true);
+    REQUIRE(loss_hess.RequiresHessian()  == true);
+}
+
+TEST_CASE("CPhysicsLoss missing network variable throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "t"};
+    std::vector<std::string> net_out = {"u", "p"};
+    
+    CPhysicsEquation eq;
+    eq.name = "bad_input";
+    eq.input_names  = {"z"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("test", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+        
+    eq.name = "bad_output";
+    eq.input_names  = {"x"};
+    eq.output_names = {"v"};
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("test", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss duplicate physics names throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "dup_phys";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("dup_physics", net_in, net_out, {"fx", "fx"}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss correct MSE with per-equation residuals", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    int eq1_calls = 0;
+    int eq2_calls = 0;
+    
+    CPhysicsEquation eq1;
+    eq1.name = "eq1";
+    eq1.input_names  = {"x"};
+    eq1.output_names = {"u"};
+    eq1.residual = [&eq1_calls](const PhysicsState&, const PhysicsData&) {
+        ++eq1_calls;
+        return eq1_calls == 1 ? mlpdouble(2.0) : mlpdouble(1.0);
     };
-
-    // No derivatives used -> set flags false
-    CPhysicsLoss loss("math_test", math_fn, 2, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    PredictionResult pred1;
-    pred1.inputs = {1.0};
-    pred1.outputs = {1.0};
-
-    PredictionResult pred2;
-    pred2.inputs = {2.0};
-    pred2.outputs = {2.0};
-
-    std::vector<PredictionResult> preds = {pred1, pred2};
-    std::vector<std::vector<mlpdouble>> ref_data;
-
-    mlpdouble result = loss.Evaluate(preds, ref_data);
-    // Expected: (13 + 17) / (2 points * 2 equations) = 30 / 4 = 7.5
+    
+    CPhysicsEquation eq2;
+    eq2.name = "eq2";
+    eq2.input_names  = {"x"};
+    eq2.output_names = {"u"};
+    eq2.residual = [&eq2_calls](const PhysicsState&, const PhysicsData&) {
+        ++eq2_calls;
+        return eq2_calls == 1 ? mlpdouble(3.0) : mlpdouble(4.0);
+    };
+    
+    CPhysicsLoss loss("math_test", net_in, net_out, {}, {eq1, eq2});
+    PredictionResult pred1 = MakePrediction({1.0}, {1.0});
+    PredictionResult pred2 = MakePrediction({2.0}, {2.0});
+    
+    mlpdouble result = loss.Evaluate({pred1, pred2}, {});
     REQUIRE_EQUAL_TOL(result, 7.5, 1e-12);
     REQUIRE_EQUAL_TOL(loss.GetLastLossValue(), 7.5, 1e-12);
 }
 
-// -----------------------------------------------------------------
-// 6. empty predictions returns zero
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss empty predictions", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("CPhysicsLoss empty predictions", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{1.0};
-    };
-
-    CPhysicsLoss loss("empty_test", dummy_fn, 1, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    std::vector<PredictionResult> preds;
-    std::vector<std::vector<mlpdouble>> ref_data;
-    mlpdouble result = loss.Evaluate(preds, ref_data);
+    CPhysicsEquation eq;
+    eq.name = "empty_test";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(1.0); };
+    
+    CPhysicsLoss loss("empty_test", net_in, net_out, {}, {eq});
+    mlpdouble result = loss.Evaluate({}, {});
     REQUIRE_EQUAL_TOL(result, 0.0, 1e-12);
+    REQUIRE_EQUAL_TOL(loss.GetLastLossValue(), 0.0, 1e-12);
 }
 
-// -----------------------------------------------------------------
-// 7. PhysicsState accessor mapping (uses Jacobian and Hessian)
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsState accessor mapping", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x", "y", "t"};
+TEST_CASE("PhysicsState accessor mapping", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y", "t"};
     std::vector<std::string> net_out = {"u", "v", "p"};
-
-    std::vector<mlpdouble> captured_in;
-    std::vector<mlpdouble> captured_out;
-    std::vector<std::vector<mlpdouble>> captured_jac;
-    std::vector<std::vector<std::vector<mlpdouble>>> captured_hess;
-
-    ResidualFunction capture_fn = [&](const PhysicsState& s) {
-        // eq_in_names = {"t", "x", "y"} -> indices {2, 0, 1}
-        captured_in.push_back(s.In(0)); // t -> 30.0
-        captured_in.push_back(s.In(1)); // x -> 10.0
-        captured_in.push_back(s.In(2)); // y -> 20.0
-
-        // eq_out_names = {"p", "u"} -> indices {2, 0}
-        captured_out.push_back(s.Out(0)); // p -> 300.0
-        captured_out.push_back(s.Out(1)); // u -> 100.0
-
-        // Jac(out_idx, in_idx)
-        // s.Jac(0, 2) -> out="p"(idx 2), in="y"(idx 1) -> pred.output_Jacobian[2][1]
-        // s.Jac(1, 0) -> out="u"(idx 0), in="t"(idx 2) -> pred.output_Jacobian[0][2]
-        captured_jac.push_back({s.Jac(0, 2), s.Jac(1, 0)});
-
-        // Hess(out_idx, in1_idx, in2_idx)
-        // s.Hess(0, 2, 0) -> out="p"(idx 2), in1="y"(idx 1), in2="t"(idx 2)
-        captured_hess.push_back({{s.Hess(0, 2, 0)}});
-
-        return std::vector<mlpdouble>{0.0};
+    std::vector<mlpdouble> captured_in, captured_out, captured_jac, captured_hess;
+    
+    CPhysicsEquation eq;
+    eq.name = "accessor_test";
+    eq.input_names  = {"t", "x", "y"};
+    eq.output_names = {"p", "u"};
+    eq.requires_jacobian = true;
+    eq.requires_hessian  = true;
+    eq.residual = [&](const PhysicsState& s, const PhysicsData&) {
+        captured_in.push_back(s.EquationIn(0));
+        captured_in.push_back(s.EquationIn(1));
+        captured_in.push_back(s.EquationIn(2));
+        captured_out.push_back(s.EquationOut(0));
+        captured_out.push_back(s.EquationOut(1));
+        captured_jac.push_back(s.EquationJac(2, 0));
+        captured_jac.push_back(s.EquationJac(0, 1));
+        captured_hess.push_back(s.EquationHess(2, 0, 0));
+        return mlpdouble(0.0);
     };
-
-    // Needs Jacobian and Hessian (default flags true)
-    CPhysicsLoss loss("accessor_test", capture_fn, 1,
-                      {"t", "x", "y"}, {"p", "u"},
-                      net_in, net_out);
-
-    // ------------------------------------------------------------
-    // Build raw Jacobian (3x3) and Hessian (3x3x3) structures
-    // ------------------------------------------------------------
-    // 1) Jacobian: 2D data stored in vector, then build row pointers
-    std::vector<std::vector<mlpdouble>> jac_data(3, std::vector<mlpdouble>(3, 0.0));
-    jac_data[0][0] = 1.0;   // du/dx
-    jac_data[0][2] = 5.0;   // du/dt
-    jac_data[2][1] = 3.0;   // dp/dy
-
-    std::vector<mlpdouble*> jac_ptrs(3);
-    for (int i = 0; i < 3; ++i)
-        jac_ptrs[i] = jac_data[i].data();
-
-    // 2) Hessian: 3D data stored in nested vectors, then build pointer hierarchy
-    std::vector<std::vector<std::vector<mlpdouble>>> hess_data(
-        3, std::vector<std::vector<mlpdouble>>(3, std::vector<mlpdouble>(3, 0.0)));
-    hess_data[2][1][2] = 4.0;  // d²p/dydt
-
-    // Build intermediate pointers: hess_ptrs2[i][j] points to row j of hess_data[i]
-    std::vector<std::vector<mlpdouble*>> hess_rows(3);
-    for (int i = 0; i < 3; ++i) {
-        hess_rows[i].resize(3);
-        for (int j = 0; j < 3; ++j)
-            hess_rows[i][j] = hess_data[i][j].data();
-    }
-    std::vector<mlpdouble**> hess_ptrs2(3);
-    for (int i = 0; i < 3; ++i)
-        hess_ptrs2[i] = hess_rows[i].data();
-
-    // Now assign to PredictionResult
-    PredictionResult pred;
-    pred.inputs = {10.0, 20.0, 30.0};   // x=10, y=20, t=30
-    pred.outputs = {100.0, 200.0, 300.0}; // u=100, v=200, p=300
-    pred.output_Jacobian = jac_ptrs.data();    // double**
-    pred.output_Hessian  = hess_ptrs2.data();  // double***
-
-    std::vector<PredictionResult> preds = {pred};
-    std::vector<std::vector<mlpdouble>> ref_data;
-
-    loss.Evaluate(preds, ref_data);
-
-    // Verify inputs (t=30, x=10, y=20)
+    
+    CPhysicsLoss loss("accessor_test", net_in, net_out, {}, {eq});
+    mlpdouble** jac  = AllocateJacobian(3, 3);
+    mlpdouble*** hess = AllocateHessian(3, 3);
+    
+    jac[1][2] = 3.0;
+    jac[2][0] = 5.0;
+    hess[1][2][2] = 4.0;
+    
+    PredictionResult pred = MakePrediction({10.0, 20.0, 30.0}, {100.0, 200.0, 300.0}, jac, hess);
+    loss.Evaluate({pred}, {});
+    
     REQUIRE_EQUAL_TOL(captured_in[0], 30.0, 1e-12);
     REQUIRE_EQUAL_TOL(captured_in[1], 10.0, 1e-12);
     REQUIRE_EQUAL_TOL(captured_in[2], 20.0, 1e-12);
-
-    // Verify outputs (p=300, u=100)
     REQUIRE_EQUAL_TOL(captured_out[0], 300.0, 1e-12);
     REQUIRE_EQUAL_TOL(captured_out[1], 100.0, 1e-12);
-
-    // Verify Jacobians (dp/dy=3.0, du/dt=5.0)
-    REQUIRE_EQUAL_TOL(captured_jac[0][0], 3.0, 1e-12);
-    REQUIRE_EQUAL_TOL(captured_jac[0][1], 5.0, 1e-12);
-
-    // Verify Hessians (d²p/dydt=4.0)
-    REQUIRE_EQUAL_TOL(captured_hess[0][0][0], 4.0, 1e-12);
+    REQUIRE_EQUAL_TOL(captured_jac[0], 3.0, 1e-12);
+    REQUIRE_EQUAL_TOL(captured_jac[1], 5.0, 1e-12);
+    REQUIRE_EQUAL_TOL(captured_hess[0], 4.0, 1e-12);
+    
+    FreeJacobian(jac, 3);
+    FreeHessian(hess, 3);
 }
 
-// ============================================================
-// New tests for RHS handling and null pointer checks
-// ============================================================
-
-// -----------------------------------------------------------------
-// 8. uniform RHS via SetUniformRHS
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss uniform RHS via SetUniformRHS", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("CPhysicsLoss passes per-point physics data", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "t"};
     std::vector<std::string> net_out = {"u"};
-
-    // Residual = u - Rhs(0)  (so loss should be zero if u == Rhs)
-    ResidualFunction rhs_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{s.Out(0) - s.Rhs(0)};
+    std::vector<mlpdouble> captured_source;
+    
+    CPhysicsEquation eq;
+    eq.name = "rhs";
+    eq.input_names  = {"x", "t"};
+    eq.output_names = {"u"};
+    eq.requires_jacobian = true;
+    eq.residual = [&](const PhysicsState& s, const PhysicsData& data) {
+        captured_source.push_back(data.Ref("source"));
+        return s.EquationJac(1, 0) - data.Ref("source");
     };
-
-    CPhysicsLoss loss("uniform_rhs", rhs_fn, 1, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    // Set uniform RHS = 3.0
-    loss.SetUniformRHS({3.0});
-
-    PredictionResult pred;
-    pred.inputs = {1.0};
-    pred.outputs = {3.0};   // exactly matches RHS -> residual = 0
-
-    std::vector<PredictionResult> preds = {pred};
-    std::vector<std::vector<mlpdouble>> ref_data;  // empty -> uses uniform RHS
-
-    mlpdouble result = loss.Evaluate(preds, ref_data);
+    
+    CPhysicsLoss loss("rhs_test", net_in, net_out, {"source"}, {eq});
+    mlpdouble** jac1 = AllocateJacobian(2, 1);
+    jac1[1][0] = 10.0;
+    PredictionResult pred1 = MakePrediction({1.0, 0.0}, {2.0}, jac1);
+    
+    mlpdouble** jac2 = AllocateJacobian(2, 1);
+    jac2[1][0] = 20.0;
+    PredictionResult pred2 = MakePrediction({2.0, 1.0}, {3.0}, jac2);
+    
+    std::vector<std::vector<mlpdouble>> physics_data = {{10.0}, {20.0}};
+    mlpdouble result = loss.Evaluate({pred1, pred2}, physics_data);
+    
     REQUIRE_EQUAL_TOL(result, 0.0, 1e-12);
-
-    // Now set output to 5.0, residual = 2.0, squared loss = 4.0 / (1*1) = 4.0
-    pred.outputs = {5.0};
-    preds = {pred};
-    result = loss.Evaluate(preds, ref_data);
-    REQUIRE_EQUAL_TOL(result, 4.0, 1e-12);
+    REQUIRE(captured_source.size() == 2);
+    REQUIRE_EQUAL_TOL(captured_source[0], 10.0, 1e-12);
+    REQUIRE_EQUAL_TOL(captured_source[1], 20.0, 1e-12);
+    
+    FreeJacobian(jac1, 2);
+    FreeJacobian(jac2, 2);
 }
 
-// -----------------------------------------------------------------
-// 9. per-point RHS via ref_data
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss per-point RHS via ref_data", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("CPhysicsLoss rejects physics data row count mismatch", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-
-    ResidualFunction rhs_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{s.Out(0) - s.Rhs(0)};
-    };
-
-    CPhysicsLoss loss("per_point_rhs", rhs_fn, 1, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    // Two points
-    PredictionResult pred1; pred1.inputs = {1.0}; pred1.outputs = {2.0};
-    PredictionResult pred2; pred2.inputs = {2.0}; pred2.outputs = {5.0};
-    std::vector<PredictionResult> preds = {pred1, pred2};
-
-    // ref_data: per-point RHS: [1.0] for first point, [3.0] for second
-    std::vector<std::vector<mlpdouble>> ref_data = {{1.0}, {3.0}};
-
-    // Residuals: (2-1)=1, (5-3)=2 -> squares sum = 1+4=5 -> loss = 5 / (2*1) = 2.5
-    mlpdouble result = loss.Evaluate(preds, ref_data);
-    REQUIRE_EQUAL_TOL(result, 2.5, 1e-12);
-
-    // Also test that uniform RHS is ignored when ref_data is non-empty
-    loss.SetUniformRHS({0.0});
-    result = loss.Evaluate(preds, ref_data);
-    REQUIRE_EQUAL_TOL(result, 2.5, 1e-12);  // still uses per-point
+    CPhysicsEquation eq;
+    eq.name = "rows";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    CPhysicsLoss loss("physics_rows", net_in, net_out, {"source"}, {eq});
+    PredictionResult p1 = MakePrediction({0.0}, {0.0});
+    PredictionResult p2 = MakePrediction({1.0}, {1.0});
+    
+    REQUIRE_THROWS_AS(
+        loss.Evaluate({p1, p2}, {{0.0}}),
+        std::invalid_argument);
 }
 
-// -----------------------------------------------------------------
-// 10. RHS size mismatch throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss RHS size mismatch throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("CPhysicsLoss rejects physics data row size mismatch", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-
-    // FIX: return correct number of residuals (2) so that RHS size checks are reached.
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{0.0, 0.0};
-    };
-
-    CPhysicsLoss loss("rhs_size", dummy_fn, 2, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    PredictionResult pred; pred.inputs = {1.0}; pred.outputs = {1.0};
-    std::vector<PredictionResult> preds = {pred};
-
-    // ref_data row size = 3, expected 0, 1, or 2 -> throws
-    std::vector<std::vector<mlpdouble>> ref_data = {{1.0, 2.0, 3.0}};
-    REQUIRE_THROWS_AS(loss.Evaluate(preds, ref_data), std::runtime_error);
-
-    // row size = 1 is allowed (applied to all equations)
-    ref_data = {{5.0}};
-    REQUIRE_NOTHROW(loss.Evaluate(preds, ref_data));
-
-    // row size = 2 is allowed
-    ref_data = {{5.0, 6.0}};
-    REQUIRE_NOTHROW(loss.Evaluate(preds, ref_data));
+    CPhysicsEquation eq;
+    eq.name = "size";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    CPhysicsLoss loss("physics_size", net_in, net_out, {"fx", "fy"}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    
+    REQUIRE_THROWS_AS(
+        loss.Evaluate({pred}, {{1.0}}),
+        std::invalid_argument);
 }
 
-// -----------------------------------------------------------------
-// 11. default RHS is zero
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss default RHS zero", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("CPhysicsLoss Jacobian nullptr throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "jac_null";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.requires_jacobian = true;
+    eq.residual = [](const PhysicsState& s, const PhysicsData&) { return s.EquationJac(0, 0); };
+    
+    CPhysicsLoss loss("jac_null", net_in, net_out, {}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {1.0}, nullptr, nullptr);
+    
+    REQUIRE_THROWS_AS(
+        loss.Evaluate({pred}, {}),
+        std::invalid_argument);
+}
 
-    ResidualFunction check_rhs = [](const PhysicsState& s) {
-        // Rhs returns 0 by default
-        return std::vector<mlpdouble>{s.Rhs(0)};
+TEST_CASE("CPhysicsLoss Hessian nullptr throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "hess_null";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.requires_jacobian = true;
+    eq.requires_hessian  = true;
+    eq.residual = [](const PhysicsState& s, const PhysicsData&) { return s.EquationHess(0, 0, 0); };
+    
+    CPhysicsLoss loss("hess_null", net_in, net_out, {}, {eq});
+    mlpdouble** jac = AllocateJacobian(1, 1);
+    PredictionResult pred = MakePrediction({1.0}, {1.0}, jac, nullptr);
+    
+    REQUIRE_THROWS_AS(
+        loss.Evaluate({pred}, {}),
+        std::invalid_argument);
+        
+    FreeJacobian(jac, 1);
+}
+
+TEST_CASE("CPhysicsLoss multiple source terms via separate equations", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y", "t"};
+    std::vector<std::string> net_out = {"u", "v"};
+    
+    CPhysicsEquation eq1;
+    eq1.name = "u_rhs";
+    eq1.input_names  = {"x", "y", "t"};
+    eq1.output_names = {"u"};
+    eq1.requires_jacobian = true;
+    eq1.residual = [](const PhysicsState& s, const PhysicsData& data) {
+        return s.EquationJac(2, 0) - data.Ref("fx");
     };
-
-    CPhysicsLoss loss("default_zero", check_rhs, 1, {"x"}, {"u"},
-                      net_in, net_out, false, false);
-
-    PredictionResult pred; pred.inputs = {1.0}; pred.outputs = {1.0};
-    std::vector<PredictionResult> preds = {pred};
-
-    // No uniform RHS set, ref_data empty -> Rhs(0) should be 0
-    std::vector<std::vector<mlpdouble>> ref_data;
-    mlpdouble result = loss.Evaluate(preds, ref_data);
-    // residual = 0, loss = 0
+    
+    CPhysicsEquation eq2;
+    eq2.name = "v_rhs";
+    eq2.input_names  = {"x", "y", "t"};
+    eq2.output_names = {"v"};
+    eq2.requires_jacobian = true;
+    eq2.residual = [](const PhysicsState& s, const PhysicsData& data) {
+        return s.EquationJac(2, 0) - data.Ref("fy");
+    };
+    
+    CPhysicsLoss loss("multiple_rhs", net_in, net_out, {"fx", "fy"}, {eq1, eq2});
+    mlpdouble** jac = AllocateJacobian(3, 2);
+    jac[2][0] = 5.0;
+    jac[2][1] = 7.0;
+    
+    PredictionResult pred = MakePrediction({1.0, 2.0, 3.0}, {10.0, 20.0}, jac);
+    std::vector<std::vector<mlpdouble>> physics_data = {{5.0, 7.0}};
+    
+    mlpdouble result = loss.Evaluate({pred}, physics_data);
     REQUIRE_EQUAL_TOL(result, 0.0, 1e-12);
+    FreeJacobian(jac, 3);
 }
 
-// -----------------------------------------------------------------
-// 12. Jacobian nullptr throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss Jacobian nullptr throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("PhysicsData accessor mapping", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-
-    // Residual uses Jac (needs_jacobian=true by default)
-    ResidualFunction jac_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{s.Jac(0,0)};
+    std::vector<mlpdouble> captured;
+    
+    CPhysicsEquation eq;
+    eq.name = "data_accessor";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [&](const PhysicsState&, const PhysicsData& data) {
+        captured.push_back(data.Ref("rho"));
+        captured.push_back(data.Ref("mu"));
+        return mlpdouble(0.0);
     };
-
-    CPhysicsLoss loss("jac_null", jac_fn, 1, {"x"}, {"u"},
-                      net_in, net_out);  // default needs_jacobian=true
-
-    PredictionResult pred;
-    pred.inputs = {1.0};
-    pred.outputs = {1.0};
-    pred.output_Jacobian = nullptr;   // explicitly null
-
-    std::vector<PredictionResult> preds = {pred};
-    std::vector<std::vector<mlpdouble>> ref_data;
-
-    REQUIRE_THROWS_AS(loss.Evaluate(preds, ref_data), std::runtime_error);
+    
+    CPhysicsLoss loss("physics_data_accessor", net_in, net_out, {"rho", "mu"}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {2.0});
+    loss.Evaluate({pred}, {{1000.0, 0.001}});
+    
+    REQUIRE(captured.size() == 2);
+    REQUIRE_EQUAL_TOL(captured[0], 1000.0, 1e-12);
+    REQUIRE_EQUAL_TOL(captured[1], 0.001, 1e-12);
 }
 
-// -----------------------------------------------------------------
-// 13. Hessian nullptr throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss Hessian nullptr throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("PhysicsData missing variable throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-
-    // Residual uses Hess (needs_hessian=true)
-    ResidualFunction hess_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{s.Hess(0,0,0)};
-    };
-
-    CPhysicsLoss loss("hess_null", hess_fn, 1, {"x"}, {"u"},
-                      net_in, net_out, true, true);  // jac=true, hess=true
-
-    // Allocate a dummy Jacobian (needs_jacobian is true, so it must not be null)
-    std::vector<std::vector<mlpdouble>> jac_data(1, std::vector<mlpdouble>(1, 0.0));
-    std::vector<mlpdouble*> jac_ptrs(1, jac_data[0].data());
-
-    PredictionResult pred;
-    pred.inputs = {1.0};
-    pred.outputs = {1.0};
-    pred.output_Jacobian = jac_ptrs.data();   // valid pointer
-    pred.output_Hessian = nullptr;            // explicitly null
-
-    std::vector<PredictionResult> preds = {pred};
-    std::vector<std::vector<mlpdouble>> ref_data;
-
-    REQUIRE_THROWS_AS(loss.Evaluate(preds, ref_data), std::runtime_error);
+    CPhysicsEquation eq;
+    eq.name = "missing_var";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData& data) { return data.Ref("does_not_exist"); };
+    
+    CPhysicsLoss loss("missing_physics", net_in, net_out, {}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    
+    REQUIRE_THROWS_AS(
+        loss.Evaluate({pred}, {}),
+        std::out_of_range);
 }
 
-// -----------------------------------------------------------------
-// 14. SetUniformRHS size mismatch throws
-// -----------------------------------------------------------------
-TEST_CASE("CPhysicsLoss SetUniformRHS size mismatch throws", "[CPhysicsLoss]")
-{
-    std::vector<std::string> net_in = {"x"};
+TEST_CASE("PhysicsData Has detects configured variables", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
     std::vector<std::string> net_out = {"u"};
-    ResidualFunction dummy_fn = [](const PhysicsState& s) {
-        return std::vector<mlpdouble>{0.0};
+    CPhysicsEquation eq;
+    eq.name = "has_test";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData& data) {
+        REQUIRE(data.Has("fx"));
+        REQUIRE(data.Has("fy"));
+        REQUIRE_FALSE(data.Has("fz"));
+        return mlpdouble(0.0);
     };
+    
+    CPhysicsLoss loss("has_test", net_in, net_out, {"fx", "fy"}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    loss.Evaluate({pred}, {{1.0, 2.0}});
+}
 
-    CPhysicsLoss loss("uniform_size", dummy_fn, 2, {"x"}, {"u"},
-                      net_in, net_out, false, false);
+TEST_CASE("PhysicsState index-based access", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y"};
+    std::vector<std::string> net_out = {"u", "v"};
+    CPhysicsEquation eq;
+    eq.name = "index_access";
+    eq.input_names  = {"x", "y"};
+    eq.output_names = {"u", "v"};
+    eq.residual = [](const PhysicsState& s, const PhysicsData&) {
+        REQUIRE_EQUAL_TOL(s.In(0), 10.0, 1e-12);
+        REQUIRE_EQUAL_TOL(s.In(1), 20.0, 1e-12);
+        REQUIRE_EQUAL_TOL(s.Out(0), 100.0, 1e-12);
+        REQUIRE_EQUAL_TOL(s.Out(1), 200.0, 1e-12);
+        return mlpdouble(0.0);
+    };
+    
+    CPhysicsLoss loss("index_access", net_in, net_out, {}, {eq});
+    PredictionResult pred = MakePrediction({10.0, 20.0}, {100.0, 200.0});
+    loss.Evaluate({pred}, {});
+}
 
-    // n_equations = 2, so setting RHS of size 1 should throw
-    REQUIRE_THROWS_AS(loss.SetUniformRHS({1.0}), std::invalid_argument);
-    // size 2 is fine
-    REQUIRE_NOTHROW(loss.SetUniformRHS({1.0, 2.0}));
+TEST_CASE("PhysicsState bounds checking", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "bounds";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState& s, const PhysicsData&) {
+        REQUIRE_THROWS_AS(s.In(1),  std::out_of_range);
+        REQUIRE_THROWS_AS(s.Out(1), std::out_of_range);
+        return mlpdouble(0.0);
+    };
+    
+    CPhysicsLoss loss("bounds_test", net_in, net_out, {}, {eq});
+    PredictionResult pred = MakePrediction({1.0}, {2.0});
+    loss.Evaluate({pred}, {});
+}
+
+TEST_CASE("CPhysicsLoss EvaluateOne returns raw loss", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq1;
+    eq1.name = "r1";
+    eq1.input_names  = {"x"};
+    eq1.output_names = {"u"};
+    eq1.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(3.0); };
+    
+    CPhysicsEquation eq2;
+    eq2.name = "r2";
+    eq2.input_names  = {"x"};
+    eq2.output_names = {"u"};
+    eq2.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(4.0); };
+    
+    CPhysicsLoss loss("raw_test", net_in, net_out, {}, {eq1, eq2});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    
+    mlpdouble raw = loss.EvaluateOne(pred);
+    REQUIRE_EQUAL_TOL(raw, 25.0, 1e-12);
+    
+    mlpdouble normalized = loss.Evaluate({pred}, {});
+    REQUIRE_EQUAL_TOL(normalized, 12.5, 1e-12);
+}
+
+TEST_CASE("CPhysicsLoss per-equation weights", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq1;
+    eq1.name = "weighted";
+    eq1.input_names  = {"x"};
+    eq1.output_names = {"u"};
+    eq1.weight = 2.0;
+    eq1.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(3.0); };
+    
+    CPhysicsEquation eq2;
+    eq2.name = "unweighted";
+    eq2.input_names  = {"x"};
+    eq2.output_names = {"u"};
+    eq2.weight = 1.0;
+    eq2.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(4.0); };
+    
+    CPhysicsLoss loss("weight_test", net_in, net_out, {}, {eq1, eq2});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    
+    mlpdouble raw = loss.EvaluateOne(pred);
+    REQUIRE_EQUAL_TOL(raw, 34.0, 1e-12);
+    
+    mlpdouble normalized = loss.Evaluate({pred}, {});
+    REQUIRE_EQUAL_TOL(normalized, 17.0, 1e-12);
+}
+
+TEST_CASE("CPhysicsLoss negative weight throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "neg_weight";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.weight = -1.0;
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("neg", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss duplicate network input names throws", "[CPhysicsLoss]") {
+    std::vector<std::string> dup_in  = {"x", "x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "dup_net";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("dup_net_in", dup_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss duplicate network output names throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> dup_out = {"u", "u"};
+    CPhysicsEquation eq;
+    eq.name = "dup_net";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("dup_net_out", net_in, dup_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss empty equation name throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("empty_eq_name", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsEquation duplicate input names throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "dup_eq_in";
+    eq.input_names  = {"x", "x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("dup_eq_in", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsEquation duplicate output names throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u", "v"};
+    CPhysicsEquation eq;
+    eq.name = "dup_eq_out";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u", "u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("dup_eq_out", net_in, net_out, {}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss equations with different subsets", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y", "t"};
+    std::vector<std::string> net_out = {"u", "v"};
+    
+    CPhysicsEquation eq1;
+    eq1.name = "u_eq";
+    eq1.input_names  = {"x", "t"};
+    eq1.output_names = {"u"};
+    eq1.requires_jacobian = true;
+    eq1.residual = [](const PhysicsState& s, const PhysicsData&) {
+        return s.EquationJac(1, 0) - mlpdouble(5.0);
+    };
+    
+    CPhysicsEquation eq2;
+    eq2.name = "v_eq";
+    eq2.input_names  = {"y", "t"};
+    eq2.output_names = {"v"};
+    eq2.requires_jacobian = true;
+    eq2.residual = [](const PhysicsState& s, const PhysicsData&) {
+        return s.EquationJac(1, 0) - mlpdouble(7.0);
+    };
+    
+    CPhysicsLoss loss("subset_test", net_in, net_out, {}, {eq1, eq2});
+    mlpdouble** jac = AllocateJacobian(3, 2);
+    jac[2][0] = 5.0;
+    jac[2][1] = 7.0;
+    
+    PredictionResult pred = MakePrediction({1.0, 2.0, 3.0}, {10.0, 20.0}, jac);
+    mlpdouble result = loss.Evaluate({pred}, {});
+    REQUIRE_EQUAL_TOL(result, 0.0, 1e-12);
+    FreeJacobian(jac, 3);
+}
+
+TEST_CASE("CPhysicsLoss empty physics variable name throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "empty_phys";
+    eq.input_names  = {"x"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    REQUIRE_THROWS_AS(
+        CPhysicsLoss("empty_phys", net_in, net_out, {"", "fx"}, {eq}),
+        std::invalid_argument);
+}
+
+TEST_CASE("CPhysicsLoss PredictionResult dimension mismatch throws", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x", "y"};
+    std::vector<std::string> net_out = {"u"};
+    CPhysicsEquation eq;
+    eq.name = "dim";
+    eq.input_names  = {"x", "y"};
+    eq.output_names = {"u"};
+    eq.residual = [](const PhysicsState&, const PhysicsData&) { return mlpdouble(0.0); };
+    
+    CPhysicsLoss loss("dim_test", net_in, net_out, {}, {eq});
+    
+    PredictionResult bad_in = MakePrediction({1.0}, {1.0});
+    REQUIRE_THROWS_AS(loss.EvaluateOne(bad_in), std::invalid_argument);
+    
+    PredictionResult bad_out = MakePrediction({1.0, 2.0}, {1.0, 2.0});
+    REQUIRE_THROWS_AS(loss.EvaluateOne(bad_out), std::invalid_argument);
+}
+
+TEST_CASE("Jac/Hess throws when pointer is null regardless of flags", "[CPhysicsLoss]") {
+    std::vector<std::string> net_in  = {"x"};
+    std::vector<std::string> net_out = {"u"};
+    
+    CPhysicsEquation eq_bad;
+    eq_bad.name = "undeclared_jac";
+    eq_bad.input_names  = {"x"};
+    eq_bad.output_names = {"u"};
+    eq_bad.requires_jacobian = false;
+    eq_bad.residual = [](const PhysicsState& s, const PhysicsData&) {
+        return s.EquationJac(0, 0);
+    };
+    
+    CPhysicsLoss loss("undeclared", net_in, net_out, {}, {eq_bad});
+    PredictionResult pred = MakePrediction({1.0}, {1.0});
+    
+    REQUIRE_THROWS_AS(
+        loss.EvaluateOne(pred),
+        std::runtime_error);
 }

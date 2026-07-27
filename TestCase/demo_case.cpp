@@ -172,15 +172,15 @@ int main() {
     anneal_cfg.alpha        = 0.9;
     anneal_cfg.lambda_init  = 1.0;
     anneal_cfg.lambda_min   = 1e-4;
-    anneal_cfg.lambda_max   = 10.0;
+    anneal_cfg.lambda_max   =0;
 
     // =========================================================================
-    // 8. Configure trainer (WITH PHYSICS MINI-BATCHING)
+    // 8. Configure trainer
     // =========================================================================
     TrainerConfig trainer_cfg;
-    trainer_cfg.max_epochs         = 80;
-    trainer_cfg.batch_size         = N;    // Full-batch supervised training
-    trainer_cfg.physics_batch_size = 4;    // NEW: Sample 4 physics points per step
+    trainer_cfg.max_epochs         = 200;
+    trainer_cfg.batch_size         = 512;    
+    trainer_cfg.physics_batch_size = 4;    
     trainer_cfg.conv_tol_abs       = 1e-8;
     trainer_cfg.conv_tol_rel       = 1e-6;
     trainer_cfg.use_annealer       = true;

@@ -4,9 +4,9 @@
 
 namespace MLPToolbox {
 
-class CDataLoss : public CBaseLoss {  // FIX 1: Added 'public'
+class CMeanSquaredErrorLoss : public CBaseLoss {  // FIX 1: Added 'public'
 public:
-    CDataLoss() : CBaseLoss("data loss") {}
+    CMeanSquaredErrorLoss() : CBaseLoss("data loss") {}
 
     mlpdouble Evaluate(
         const std::vector<PredictionResult>& predictions,
