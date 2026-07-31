@@ -14,6 +14,7 @@ add_executable(test_mlp_trainer CMLPTrainer_tests.cpp)
 add_executable(test_data_loss CDataLoss_tests.cpp)
 add_executable(test_physics_loss CPhysicsLoss_tests.cpp)
 add_executable(test_demo_case ../TestCase/demo_case.cpp)
+add_executable(test_demo_case_source ../TestCase/demo_case_source.cpp)
 
 
 
@@ -31,6 +32,7 @@ target_include_directories(test_mlp_trainer PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_data_loss PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_physics_loss PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_demo_case PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_demo_case_source PRIVATE ${TEST_INCLUDE_DIRS})
 
 
 
@@ -43,6 +45,7 @@ add_test(NAME test_mlp_trainer COMMAND test_mlp_trainer)
 add_test(NAME test_data_loss COMMAND test_data_loss)
 add_test(NAME test_physics_loss COMMAND test_physics_loss)
 add_test(NAME test_demo_case COMMAND test_demo_case)
+add_test(NAME test_demo_case_source COMMAND test_demo_case_source)
 
 # Tests Properties
 set_tests_properties(test_demo_case PROPERTIES WORKING_DIRECTORY ${MLPCPP_ROOT}/TestCase)
