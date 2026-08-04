@@ -19,7 +19,8 @@
  *     EvaluateOne() for every physics loss on that set
  *
  * Reference-data mode:
- *   Standard mini-batch supervised learning with an MSE loss by default.
+ *   Standard mini-batch supervised learning. Supports multiple reference
+ *   data terms (M > 1) for generic annealing.
  *
  * The trainer keeps one point worth of derivative data in memory at a time.
  *
@@ -44,7 +45,7 @@
  *
  * Convergence:
  *   Configurable via ConvergenceMetric enum.  Default is Weighted, which
- *   checks loss_total (L_ref + sum lambda_k * L_phys_k).  When the
+ *   checks loss_total (L_phys + sum lambda_k * L_ref_k).  When the
  *   annealer is off, loss_total still differs from loss_raw if any
  *   equation weight is not 1.0.
  *
@@ -86,7 +87,7 @@ namespace MLPToolbox {
 
 enum class ConvergenceMetric {
     Raw,       // Unweighted: L_ref + sum L_phys
-    Weighted   // Annealed:   L_ref + sum lambda_k * L_phys_k
+    Weighted   // Annealed:   L_phys + sum lambda_k * L_ref_k
 };
 
 struct TrainerConfig {
@@ -104,10 +105,10 @@ struct TrainerConfig {
 };
 
 struct TrainStepResult {
-    double loss_ref{0.0};
+    double loss_ref{0.0};      // Sum of all reference losses
     std::vector<double> loss_phys;
-    double loss_total{0.0};  // weighted: L_ref + sum lambda_k * L_phys_k
-    double loss_raw{0.0};    // unweighted: L_ref + sum L_phys_k
+    double loss_total{0.0};    // weighted: L_phys + sum lambda_k * L_ref_k
+    double loss_raw{0.0};      // unweighted: L_ref + sum L_phys
     std::vector<double> lambdas;
 };
 
@@ -143,10 +144,12 @@ public:
         }
     }
 
-    PredictionResult Fill(CNeuralNetwork& net,
-                          const std::vector<mlpdouble>& x,
-                          bool eval_jac,
-                          bool eval_hess)
+    // Modified to accept a pre-allocated PredictionResult to prevent heap allocations
+    void Fill(CNeuralNetwork& net,
+              const std::vector<mlpdouble>& x,
+              PredictionResult& pr,
+              bool eval_jac,
+              bool eval_hess)
     {
         if (x.size() != n_in_) {
             throw std::invalid_argument(
@@ -157,9 +160,10 @@ public:
 
         net.Predict(x, compute_jac, eval_hess);
 
-        PredictionResult pr;
         pr.inputs = x;
-        pr.outputs.resize(n_out_);
+        if (pr.outputs.size() != n_out_) {
+            pr.outputs.resize(n_out_);
+        }
 
         for (std::size_t o = 0; o < n_out_; ++o) {
             pr.outputs[o] = net.GetOutput(o);
@@ -169,9 +173,6 @@ public:
         pr.hessian  = nullptr;
 
         if (compute_jac) {
-            // Accessor convention (verified): GetJacobian(iOutput, iInput)
-            // Internally accesses output_Jacobian[iInput][iOutput].
-            // Stored in input-major buffer: jacobian[input_i][output_o].
             for (std::size_t i = 0; i < n_in_; ++i) {
                 for (std::size_t o = 0; o < n_out_; ++o) {
                     jac_flat_[i * n_out_ + o] = net.GetJacobian(o, i);
@@ -181,9 +182,6 @@ public:
         }
 
         if (eval_hess) {
-            // Accessor convention (verified): GetHessian(iOutput, iInput, jInput)
-            // Internally accesses output_Hessian[iInput][jInput][iOutput].
-            // Stored in input-major buffer: hessian[input_i][input_j][output_o].
             for (std::size_t i = 0; i < n_in_; ++i) {
                 for (std::size_t j = 0; j < n_in_; ++j) {
                     for (std::size_t o = 0; o < n_out_; ++o) {
@@ -194,8 +192,6 @@ public:
             }
             pr.hessian = hess_planes_.data();
         }
-
-        return pr;
     }
 
 private:
@@ -224,7 +220,6 @@ public:
           adam_(std::move(adam)),
           annealer_cfg_(annealer_cfg),
           cfg_(cfg),
-          ref_loss_(std::make_shared<CMeanSquaredErrorLoss>()),
           point_storage_(net.GetnInputs(), net.GetnOutputs()),
           rng_(std::random_device{}())
     {
@@ -248,27 +243,27 @@ public:
     }
 
     // ------------------------------------------------------------------------
-    // Reference loss
+    // Reference losses (Supports M > 1 for generic annealing)
     // ------------------------------------------------------------------------
 
-    void SetReferenceLoss(std::shared_ptr<CBaseLoss> loss) {
+    void AddReferenceLoss(std::shared_ptr<CBaseLoss> loss) {
         if (!loss) {
             throw std::invalid_argument(
                 "CMLPTrainer: reference loss cannot be null.");
         }
         if (built_) {
             throw std::runtime_error(
-                "CMLPTrainer: cannot change reference loss after Build().");
+                "CMLPTrainer: cannot add reference loss after Build().");
         }
-        ref_loss_ = std::move(loss);
+        ref_losses_.push_back(std::move(loss));
     }
 
-    void DisableReferenceLoss() {
+    void ClearReferenceLosses() {
         if (built_) {
             throw std::runtime_error(
-                "CMLPTrainer: cannot change reference loss after Build().");
+                "CMLPTrainer: cannot clear reference losses after Build().");
         }
-        ref_loss_.reset();
+        ref_losses_.clear();
     }
 
     // ------------------------------------------------------------------------
@@ -346,7 +341,6 @@ public:
         if (is_new) {
             set_order_.push_back(set_name);
             
-            // Initialize mini-batch tracking for this set
             coll_indices_[set_name].resize(points.size());
             std::iota(coll_indices_[set_name].begin(), coll_indices_[set_name].end(), std::size_t{0});
             coll_batch_cursor_[set_name] = 0;
@@ -519,11 +513,8 @@ public:
                 "CMLPTrainer: network output names must be unique.");
         }
 
-        const bool has_ref_objective =
-            (ref_loss_ != nullptr) && (total_samples_ > 0);
-
-        const bool has_phys_objective =
-            !phys_losses_.empty();
+        const bool has_ref_objective = !ref_losses_.empty() && (total_samples_ > 0);
+        const bool has_phys_objective = !phys_losses_.empty();
 
         if (!has_ref_objective && !has_phys_objective) {
             throw std::runtime_error(
@@ -562,13 +553,11 @@ public:
 
             if (n_points == 0) {
                 empty_sets_.insert(set_name);
-
                 if (cfg_.verbose) {
                     std::cout << "CMLPTrainer: collocation set '" << set_name
                               << "' is empty — loss '" << phys_losses_[k]->GetName()
                               << "' will contribute zero.\n";
                 }
-
                 continue;
             }
 
@@ -611,7 +600,7 @@ public:
         annealer_.reset();
         if (cfg_.use_annealer && has_ref_objective && has_phys_objective) {
             AnnealerConfig a = annealer_cfg_;
-            a.n_data_terms = phys_losses_.size();
+            a.n_data_terms = ref_losses_.size(); // M data terms
             annealer_ = std::make_unique<CGradientAnnealer>(a);
         }
 
@@ -619,7 +608,7 @@ public:
     }
 
     // ------------------------------------------------------------------------
-    // Train one step
+    // Train one step (Optimized)
     // ------------------------------------------------------------------------
 
     TrainStepResult TrainStep() {
@@ -631,16 +620,14 @@ public:
         Tape& tape = mlpdouble::getTape();
 
         const std::size_t n_phys = phys_losses_.size();
+        const std::size_t n_ref = ref_losses_.size();
 
         // ------------------------------------------------------------
         // Reference mini-batch
         // ------------------------------------------------------------
-        std::vector<std::vector<mlpdouble>> batch_x;
-        std::vector<std::vector<mlpdouble>> batch_y;
-
-        const bool have_ref = (ref_loss_ != nullptr) && (total_samples_ > 0);
+        const bool have_ref = (n_ref > 0) && (total_samples_ > 0);
         if (have_ref) {
-            NextReferenceBatch(batch_x, batch_y);
+            NextReferenceBatch(); // Updates batch_x_ and batch_y_
         }
 
         // ------------------------------------------------------------
@@ -663,29 +650,41 @@ public:
         }
         net_.SetWeightsBiases(weights);
 
+        // Pre-allocate gradient vectors
+        g_total_d_.assign(n_w, 0.0);
+        if (g_ref_per_term_.size() < n_ref) g_ref_per_term_.resize(n_ref);
+        for (std::size_t i = 0; i < n_ref; ++i) g_ref_per_term_[i].assign(n_w, 0.0);
+        if (g_phys_.size() < n_phys) g_phys_.resize(n_phys);
+        for (std::size_t k = 0; k < n_phys; ++k) g_phys_[k].assign(n_w, 0.0);
+
+        clean_weights_ad_.resize(n_w);
+        g_total_ad_.resize(n_w);
+
         // ------------------------------------------------------------
-        // Reference loss
+        // Reference loss (Evaluate all M reference terms)
         // ------------------------------------------------------------
-        mlpdouble L_ref = mlpdouble(0.0);
+        std::vector<mlpdouble> L_ref_vec(n_ref, mlpdouble(0.0));
 
         if (have_ref) {
-            std::vector<PredictionResult> preds;
-            preds.reserve(batch_x.size());
-
-            for (const auto& x : batch_x) {
-                net_.Predict(x, false, false);
-
-                PredictionResult p;
-                p.inputs = x;
-                p.outputs.resize(net_.GetnOutputs());
-                for (std::size_t o = 0; o < net_.GetnOutputs(); ++o) {
-                    p.outputs[o] = net_.GetOutput(o);
-                }
-                preds.push_back(std::move(p));
+            if (batch_preds_.size() < batch_x_.size()) {
+                batch_preds_.resize(batch_x_.size());
             }
+            for (std::size_t i = 0; i < batch_x_.size(); ++i) {
+                if (batch_preds_[i].outputs.size() != net_.GetnOutputs()) {
+                    batch_preds_[i].outputs.resize(net_.GetnOutputs());
+                }
+                net_.Predict(batch_x_[i], false, false);
+                batch_preds_[i].inputs = batch_x_[i];
+                for (std::size_t o = 0; o < net_.GetnOutputs(); ++o) {
+                    batch_preds_[i].outputs[o] = net_.GetOutput(o);
+                }
+            }
+            batch_preds_.resize(batch_x_.size());
 
-            L_ref = ref_loss_->Evaluate(preds, batch_y);
-            tape.registerOutput(L_ref);
+            for (std::size_t i = 0; i < n_ref; ++i) {
+                L_ref_vec[i] = ref_losses_[i]->Evaluate(batch_preds_, batch_y_);
+                tape.registerOutput(L_ref_vec[i]);
+            }
         }
 
         // ------------------------------------------------------------
@@ -693,6 +692,10 @@ public:
         // ------------------------------------------------------------
         std::vector<mlpdouble> L_phys(n_phys, mlpdouble(0.0));
         std::vector<std::size_t> n_points_seen(n_phys, 0);
+
+        if (current_pred_.outputs.size() != net_.GetnOutputs()) {
+            current_pred_.outputs.resize(net_.GetnOutputs());
+        }
 
         for (const auto& set_name : active_set_order_) {
             const auto& loss_indices = losses_by_set_.at(set_name);
@@ -703,13 +706,10 @@ public:
             const bool eval_jac  = need_jac || need_hess;
             const bool eval_hess = need_hess;
 
-            // Fetch mini-batch of indices for this collocation set
-            std::vector<std::size_t> batch_indices;
-            NextPhysicsBatch(set_name, batch_indices);
+            NextPhysicsBatch(set_name); // Updates batch_indices_
 
-            for (std::size_t idx : batch_indices) {
-                PredictionResult pred =
-                    point_storage_.Fill(net_, points[idx], eval_jac, eval_hess);
+            for (std::size_t idx : batch_indices_) {
+                point_storage_.Fill(net_, points[idx], current_pred_, eval_jac, eval_hess);
 
                 for (const std::size_t k : loss_indices) {
                     const std::size_t n_phys_vars = phys_losses_[k]->NumPhysicsVariables();
@@ -725,17 +725,16 @@ public:
                     }
 
                     if (data.empty()) {
-                        L_phys[k] += phys_losses_[k]->EvaluateOne(pred);
+                        L_phys[k] += phys_losses_[k]->EvaluateOne(current_pred_);
                     } else {
-                        L_phys[k] += phys_losses_[k]->EvaluateOne(pred, data[idx]);
+                        L_phys[k] += phys_losses_[k]->EvaluateOne(current_pred_, data[idx]);
                     }
-
                     ++n_points_seen[k];
                 }
             }
         }
 
-        // Normalize physics losses (denominator adapts to mini-batch size)
+        // Normalize physics losses
         for (std::size_t k = 0; k < n_phys; ++k) {
             if (n_points_seen[k] == 0) {
                 L_phys[k] = mlpdouble(0.0);
@@ -743,14 +742,12 @@ public:
                 continue;
             }
 
-            const double denom =
-                static_cast<double>(n_points_seen[k]) *
-                static_cast<double>(phys_losses_[k]->NumEquations());
+            const double denom = static_cast<double>(n_points_seen[k]) *
+                                 static_cast<double>(phys_losses_[k]->NumEquations());
 
             if (denom <= 0.0) {
                 tape.reset();
-                throw std::runtime_error(
-                    "CMLPTrainer: invalid physics-loss normalization.");
+                throw std::runtime_error("CMLPTrainer: invalid physics-loss normalization.");
             }
 
             L_phys[k] = L_phys[k] / mlpdouble(denom);
@@ -763,95 +760,101 @@ public:
         // Reverse sweeps
         // ------------------------------------------------------------
         auto zero_gradients = [&weights]() {
-            for (auto& w : weights) {
-                w.setGradient(0.0);
-            }
+            for (auto& w : weights) w.setGradient(0.0);
         };
 
-        auto read_gradients = [&weights](std::vector<double>& g) {
-            g.resize(weights.size());
-            for (std::size_t i = 0; i < weights.size(); ++i) {
+        auto read_gradients = [&](std::vector<double>& g) {
+            for (std::size_t i = 0; i < n_w; ++i) {
                 g[i] = to_double(weights[i].getGradient());
             }
         };
 
-        std::vector<double> g_ref(n_w, 0.0);
-        if (have_ref) {
+        std::vector<double> lambdas(n_ref, 1.0);
+        const bool need_separate_grads = (annealer_ && have_ref && n_phys > 0);
+
+        if (!need_separate_grads) {
+            // FAST PATH: Single reverse sweep when annealer is off
             zero_gradients();
             tape.clearAdjoints();
 
-            L_ref.setGradient(1.0);
-            for (auto& lp : L_phys) {
-                lp.setGradient(0.0);
-            }
+            for (std::size_t i = 0; i < n_ref; ++i) L_ref_vec[i].setGradient(1.0);
+            for (std::size_t k = 0; k < n_phys; ++k) L_phys[k].setGradient(1.0);
 
             tape.evaluate();
-            read_gradients(g_ref);
-        }
-
-        std::vector<std::vector<double>> g_phys(
-            n_phys, std::vector<double>(n_w, 0.0));
-
-        for (std::size_t k = 0; k < n_phys; ++k) {
-            zero_gradients();
-            tape.clearAdjoints();
-
+            read_gradients(g_total_d_);
+        } else {
+            // SLOW PATH: N+1 sweeps for gradient annealing
             if (have_ref) {
-                L_ref.setGradient(0.0);
+                for (std::size_t i = 0; i < n_ref; ++i) {
+                    zero_gradients();
+                    tape.clearAdjoints();
+                    for (std::size_t j = 0; j < n_ref; ++j) {
+                        L_ref_vec[j].setGradient(j == i ? 1.0 : 0.0);
+                    }
+                    for (auto& lp : L_phys) lp.setGradient(0.0);
+                    tape.evaluate();
+                    read_gradients(g_ref_per_term_[i]);
+                }
             }
 
-            for (std::size_t j = 0; j < n_phys; ++j) {
-                L_phys[j].setGradient(j == k ? 1.0 : 0.0);
+            for (std::size_t k = 0; k < n_phys; ++k) {
+                zero_gradients();
+                tape.clearAdjoints();
+                for (std::size_t j = 0; j < n_ref; ++j) L_ref_vec[j].setGradient(0.0);
+                for (std::size_t j = 0; j < n_phys; ++j) {
+                    L_phys[j].setGradient(j == k ? 1.0 : 0.0);
+                }
+                tape.evaluate();
+                read_gradients(g_phys_[k]);
             }
 
-            tape.evaluate();
-            read_gradients(g_phys[k]);
+            std::vector<double> g_phys_combined(n_w, 0.0);
+            for (std::size_t k = 0; k < n_phys; ++k) {
+                for (std::size_t i = 0; i < n_w; ++i) {
+                    g_phys_combined[i] += g_phys_[k][i];
+                }
+            }
+            
+            const GradStats base_stats = GradStats::from_grads(g_phys_combined);
+            
+            std::vector<GradStats> data_stats_vec(n_ref);
+            for (std::size_t i = 0; i < n_ref; ++i) {
+                data_stats_vec[i] = GradStats::from_grads(g_ref_per_term_[i]);
+            }
+
+            annealer_->update(base_stats, data_stats_vec);
+            for (std::size_t i = 0; i < n_ref; ++i) {
+                lambdas[i] = annealer_->get_lambda(i);
+            }
+
+            for (std::size_t i = 0; i < n_w; ++i) {
+                g_total_d_[i] = 0.0;
+                for (std::size_t k = 0; k < n_phys; ++k) {
+                    g_total_d_[i] += g_phys_[k][i];
+                }
+                if (have_ref) {
+                    for (std::size_t r = 0; r < n_ref; ++r) {
+                        g_total_d_[i] += lambdas[r] * g_ref_per_term_[r][i];
+                    }
+                }
+            }
         }
 
         tape.reset();
 
         // ------------------------------------------------------------
-        // Annealing
+        // Gradient clipping
         // ------------------------------------------------------------
-        std::vector<double> lambdas(n_phys, 1.0);
-
-        if (annealer_ && have_ref && n_phys > 0) {
-            const GradStats ref_stats = GradStats::from_grads(g_ref);
-
-            std::vector<GradStats> phys_stats(n_phys);
-            for (std::size_t k = 0; k < n_phys; ++k) {
-                phys_stats[k] = GradStats::from_grads(g_phys[k]);
-            }
-
-            annealer_->update(ref_stats, phys_stats);
-            for (std::size_t k = 0; k < n_phys; ++k) {
-                lambdas[k] = annealer_->get_lambda(k);
-            }
-        }
-
-        // ------------------------------------------------------------
-        // Composite gradient
-        // ------------------------------------------------------------
-        std::vector<double> g_total_d(n_w, 0.0);
-        for (std::size_t i = 0; i < n_w; ++i) {
-            g_total_d[i] = g_ref[i];
-            for (std::size_t k = 0; k < n_phys; ++k) {
-                g_total_d[i] += lambdas[k] * g_phys[k][i];
-            }
-        }
-
-        // Gradient clipping (norm-based)
         if (cfg_.max_grad_norm > 0.0) {
             double norm_sq = 0.0;
             for (std::size_t i = 0; i < n_w; ++i) {
-                norm_sq += g_total_d[i] * g_total_d[i];
+                norm_sq += g_total_d_[i] * g_total_d_[i];
             }
-
             const double norm = std::sqrt(norm_sq);
             if (norm > cfg_.max_grad_norm) {
                 const double scale = cfg_.max_grad_norm / norm;
                 for (std::size_t i = 0; i < n_w; ++i) {
-                    g_total_d[i] *= scale;
+                    g_total_d_[i] *= scale;
                 }
             }
         }
@@ -859,33 +862,39 @@ public:
         // ------------------------------------------------------------
         // Adam update
         // ------------------------------------------------------------
-        std::vector<mlpdouble> clean_weights_ad(n_w);
-        std::vector<mlpdouble> g_total_ad(n_w);
         for (std::size_t i = 0; i < n_w; ++i) {
-            clean_weights_ad[i] = mlpdouble(to_double(weights[i]));
-            g_total_ad[i]       = mlpdouble(g_total_d[i]);
+            clean_weights_ad_[i] = mlpdouble(to_double(weights[i]));
+            g_total_ad_[i]       = mlpdouble(g_total_d_[i]);
         }
 
-        adam_.step(clean_weights_ad, g_total_ad);
-        net_.SetWeightsBiases(clean_weights_ad);
+        adam_.step(clean_weights_ad_, g_total_ad_);
+        net_.SetWeightsBiases(clean_weights_ad_);
 
         // ------------------------------------------------------------
         // Result bookkeeping
         // ------------------------------------------------------------
         TrainStepResult result;
-        result.loss_ref = have_ref ? to_double(L_ref) : 0.0;
-        result.loss_phys.resize(n_phys);
         result.lambdas = lambdas;
+        result.loss_phys.resize(n_phys);
+
+        double total_ref_loss = 0.0;
+        for (std::size_t i = 0; i < n_ref; ++i) total_ref_loss += to_double(L_ref_vec[i]);
+        result.loss_ref = have_ref ? total_ref_loss : 0.0;
 
         for (std::size_t k = 0; k < n_phys; ++k) {
             result.loss_phys[k] = to_double(L_phys[k]);
         }
 
         result.loss_raw = result.loss_ref;
-        result.loss_total = result.loss_ref;
+        result.loss_total = 0.0;
         for (std::size_t k = 0; k < n_phys; ++k) {
             result.loss_raw   += result.loss_phys[k];
-            result.loss_total += lambdas[k] * result.loss_phys[k];
+            result.loss_total += result.loss_phys[k];
+        }
+        if (have_ref) {
+            for (std::size_t r = 0; r < n_ref; ++r) {
+                result.loss_total += lambdas[r] * to_double(L_ref_vec[r]);
+            }
         }
 
         last_result_ = result;
@@ -903,7 +912,7 @@ public:
     // ------------------------------------------------------------------------
 
     void TrainEpoch() {
-        const bool has_ref = (total_samples_ > 0 && ref_loss_ != nullptr);
+        const bool has_ref = (total_samples_ > 0 && !ref_losses_.empty());
         const bool has_phys = !active_set_order_.empty();
 
         if (!has_ref && !has_phys) return;
@@ -914,12 +923,9 @@ public:
         std::size_t n_batches = 1;
         if (has_ref) {
             const std::size_t batch_size =
-                cfg_.batch_size > 0
-                    ? std::min(cfg_.batch_size, total_samples_)
-                    : total_samples_;
+                cfg_.batch_size > 0 ? std::min(cfg_.batch_size, total_samples_) : total_samples_;
             n_batches = (total_samples_ + batch_size - 1) / batch_size;
         } else if (has_phys) {
-            // If no reference data, determine n_batches from the first active physics set
             const std::string& first_set = active_set_order_[0];
             const std::size_t n_points = coll_sets_.at(first_set).size();
             const std::size_t phys_bs = cfg_.physics_batch_size > 0 ? 
@@ -928,21 +934,32 @@ public:
             if (n_batches == 0) n_batches = 1;
         }
 
+        // Reset epoch sums
         epoch_loss_sum_        = 0.0;
         epoch_loss_total_sum_  = 0.0;
+        epoch_loss_ref_sum_    = 0.0;
+        std::fill(epoch_loss_phys_sum_.begin(), epoch_loss_phys_sum_.end(), 0.0);
+        std::fill(epoch_loss_lambda_sum_.begin(), epoch_loss_lambda_sum_.end(), 0.0);
         epoch_loss_count_      = 0;
 
         for (std::size_t b = 0; b < n_batches; ++b) {
             const TrainStepResult res = TrainStep();
             epoch_loss_sum_       += res.loss_raw;
             epoch_loss_total_sum_ += res.loss_total;
+            epoch_loss_ref_sum_   += res.loss_ref;
+            
+            if (epoch_loss_phys_sum_.size() < res.loss_phys.size()) epoch_loss_phys_sum_.resize(res.loss_phys.size(), 0.0);
+            for (std::size_t k = 0; k < res.loss_phys.size(); ++k) epoch_loss_phys_sum_[k] += res.loss_phys[k];
+
+            if (epoch_loss_lambda_sum_.size() < res.lambdas.size()) epoch_loss_lambda_sum_.resize(res.lambdas.size(), 0.0);
+            for (std::size_t k = 0; k < res.lambdas.size(); ++k) epoch_loss_lambda_sum_[k] += res.lambdas[k];
+
             ++epoch_loss_count_;
         }
 
         EndEpoch();
         EndPhysicsEpoch();
     }
-
     // ------------------------------------------------------------------------
     // Full training
     // ------------------------------------------------------------------------
@@ -1005,9 +1022,41 @@ public:
         return last_result_;
     }
 
+    double GetEpochAverageLoss() const noexcept {
+        if (epoch_loss_count_ > 0) {
+            return epoch_loss_sum_ / static_cast<double>(epoch_loss_count_);
+        }
+        return last_result_.loss_raw;
+    }
+
     std::size_t GetStep() const noexcept {
         return step_;
     }
+
+    double GetEpochAverageLossRef() const noexcept {
+        if (epoch_loss_count_ > 0) return epoch_loss_ref_sum_ / static_cast<double>(epoch_loss_count_);
+        return last_result_.loss_ref;
+    }
+
+    double GetEpochAverageLossPhys(std::size_t k = 0) const noexcept {
+        if (epoch_loss_count_ > 0 && k < epoch_loss_phys_sum_.size()) {
+            return epoch_loss_phys_sum_[k] / static_cast<double>(epoch_loss_count_);
+        }
+        return (k < last_result_.loss_phys.size()) ? last_result_.loss_phys[k] : 0.0;
+    }
+
+    double GetEpochAverageLambda(std::size_t k = 0) const noexcept {
+        if (epoch_loss_count_ > 0 && k < epoch_loss_lambda_sum_.size()) {
+            return epoch_loss_lambda_sum_[k] / static_cast<double>(epoch_loss_count_);
+        }
+        return (k < last_result_.lambdas.size()) ? last_result_.lambdas[k] : 1.0;
+    }
+
+    double GetEpochAverageLossTotal() const noexcept {
+        if (epoch_loss_count_ > 0) return epoch_loss_total_sum_ / static_cast<double>(epoch_loss_count_);
+        return last_result_.loss_total;
+    }
+
 
 private:
     // ------------------------------------------------------------------------
@@ -1070,10 +1119,8 @@ private:
         }
     }
 
-    void NextPhysicsBatch(const std::string& set_name,
-                          std::vector<std::size_t>& batch_indices)
-    {
-        batch_indices.clear();
+    void NextPhysicsBatch(const std::string& set_name) {
+        batch_indices_.clear();
         auto it = coll_sets_.find(set_name);
         if (it == coll_sets_.end() || it->second.empty()) return;
 
@@ -1092,9 +1139,9 @@ private:
         const std::size_t remaining = n_points - coll_batch_cursor_[set_name];
         const std::size_t actual = std::min(phys_bs, remaining);
 
-        batch_indices.reserve(actual);
+        batch_indices_.resize(actual);
         for (std::size_t i = 0; i < actual; ++i) {
-            batch_indices.push_back(coll_indices_[set_name][coll_batch_cursor_[set_name]++]);
+            batch_indices_[i] = coll_indices_[set_name][coll_batch_cursor_[set_name]++];
         }
 
         if (coll_batch_cursor_[set_name] >= n_points) {
@@ -1102,40 +1149,29 @@ private:
         }
     }
 
-    void NextReferenceBatch(std::vector<std::vector<mlpdouble>>& out_x,
-                            std::vector<std::vector<mlpdouble>>& out_y)
-    {
-        out_x.clear();
-        out_y.clear();
+    void NextReferenceBatch() {
+        batch_x_.clear();
+        batch_y_.clear();
 
-        if (total_samples_ == 0) {
-            return;
-        }
-
-        if (!epoch_started_) {
-            PrepareEpoch();
-        }
+        if (total_samples_ == 0) return;
+        if (!epoch_started_) PrepareEpoch();
 
         const std::size_t batch_size =
-            cfg_.batch_size > 0
-                ? std::min(cfg_.batch_size, total_samples_)
-                : total_samples_;
+            cfg_.batch_size > 0 ? std::min(cfg_.batch_size, total_samples_) : total_samples_;
 
         if (batch_cursor_ >= total_samples_) {
-            throw std::logic_error(
-                "CMLPTrainer: reference batch cursor exceeded epoch boundary.");
+            throw std::logic_error("CMLPTrainer: reference batch cursor exceeded epoch boundary.");
         }
 
         const std::size_t remaining = total_samples_ - batch_cursor_;
         const std::size_t actual = std::min(batch_size, remaining);
 
-        out_x.reserve(actual);
-        out_y.reserve(actual);
-
+        batch_x_.resize(actual);
+        batch_y_.resize(actual);
         for (std::size_t i = 0; i < actual; ++i) {
             const std::size_t idx = indices_[batch_cursor_++];
-            out_x.push_back(train_inputs_[idx]);
-            out_y.push_back(train_targets_[idx]);
+            batch_x_[i] = train_inputs_[idx];
+            batch_y_[i] = train_targets_[idx];
         }
     }
 
@@ -1148,8 +1184,10 @@ private:
 
         for (std::size_t k = 0; k < r.loss_phys.size(); ++k) {
             std::cout
-                << " | phys[" << k << "]=" << r.loss_phys[k]
-                << " (lambda=" << r.lambdas[k] << ")";
+                << " | phys[" << k << "]=" << r.loss_phys[k];
+        }
+        for (std::size_t i = 0; i < r.lambdas.size(); ++i) {
+            std::cout << " (lambda_ref[" << i << "]=" << r.lambdas[i] << ")";
         }
 
         std::cout << "\n";
@@ -1166,7 +1204,7 @@ private:
     TrainerConfig cfg_;
     bool built_{false};
 
-    std::shared_ptr<CBaseLoss> ref_loss_;
+    std::vector<std::shared_ptr<CBaseLoss>> ref_losses_;
 
     std::vector<std::shared_ptr<CPhysicsLoss>> phys_losses_;
     std::vector<std::string> phys_set_name_;
@@ -1176,7 +1214,6 @@ private:
     std::vector<std::string> set_order_;
     std::unordered_set<std::string> empty_sets_;
 
-    // Mini-batch tracking for collocation sets
     std::unordered_map<std::string, std::vector<std::size_t>> coll_indices_;
     std::unordered_map<std::string, std::size_t> coll_batch_cursor_;
     std::unordered_map<std::string, bool> coll_epoch_started_;
@@ -1202,6 +1239,22 @@ private:
     double epoch_loss_sum_{0.0};
     double epoch_loss_total_sum_{0.0};
     std::size_t epoch_loss_count_{0};
+    
+    double epoch_loss_ref_sum_{0.0};
+    std::vector<double> epoch_loss_phys_sum_;
+    std::vector<double> epoch_loss_lambda_sum_;
+
+    // Pre-allocated buffers to prevent heap allocations inside TrainStep
+    std::vector<std::vector<mlpdouble>> batch_x_;
+    std::vector<std::vector<mlpdouble>> batch_y_;
+    std::vector<std::size_t> batch_indices_;
+    std::vector<PredictionResult> batch_preds_;
+    PredictionResult current_pred_;
+    std::vector<double> g_total_d_;
+    std::vector<std::vector<double>> g_ref_per_term_;
+    std::vector<std::vector<double>> g_phys_;
+    std::vector<mlpdouble> clean_weights_ad_;
+    std::vector<mlpdouble> g_total_ad_;
 };
 
 } // namespace MLPToolbox
