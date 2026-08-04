@@ -131,20 +131,20 @@ int main() {
     // =========================================================================
     // 5. Create physics loss
     // =========================================================================
-    CPhysicsEquation eq;
-    eq.name = "dy_du_eq";
-    eq.input_names = {"u"};
-    eq.output_names = {"y"};
-    eq.weight = 1.0;
-    eq.requires_jacobian = true;
-    eq.requires_hessian = false;
-    eq.residual = [](const PhysicsState& state, const PhysicsData& /*data*/) -> mlpdouble {
-        return state.EquationJac(0, 0);
-    };
-    auto physics_loss = std::make_shared<CPhysicsLoss>(
-        "dy_du_zero", net.GetInputVars(), net.GetOutputVars(),
-        std::vector<std::string>{}, std::vector<CPhysicsEquation>{eq}
-    );
+    // CPhysicsEquation eq;
+    // eq.name = "dy_du_eq";
+    // eq.input_names = {"u"};
+    // eq.output_names = {"y"};
+    // eq.weight = 1.0;
+    // eq.requires_jacobian = true;
+    // eq.requires_hessian = false;
+    // eq.residual = [](const PhysicsState& state, const PhysicsData& /*data*/) -> mlpdouble {
+    //     return state.EquationJac(0, 0);
+    // };
+    // auto physics_loss = std::make_shared<CPhysicsLoss>(
+    //     "dy_du_zero", net.GetInputVars(), net.GetOutputVars(),
+    //     std::vector<std::string>{}, std::vector<CPhysicsEquation>{eq}
+    // );
 
     // =========================================================================
     // 6. Create optimizer
@@ -170,7 +170,7 @@ int main() {
     trainer_cfg.physics_batch_size = 32;    
     trainer_cfg.conv_tol_abs       = 1e-8;
     trainer_cfg.conv_tol_rel       = 1e-6;
-    trainer_cfg.use_annealer       = true;   // Set to false for pure data comparison
+    trainer_cfg.use_annealer       = false;   // Set to false for pure data comparison
     trainer_cfg.verbose            = true;
     trainer_cfg.log_every          = 10;
     trainer_cfg.shuffle_per_epoch  = true;
@@ -189,21 +189,21 @@ int main() {
     // =========================================================================
     // 11. Register physics collocation set
     // =========================================================================
-    std::vector<std::vector<mlpdouble>> physics_points;
-    const int Ncoll = 200;
-    for (int i = 0; i < Ncoll; ++i) {
-        double t = static_cast<double>(i) / (Ncoll - 1);
-        physics_points.push_back({
-            mlpdouble(u_min + t * (u_max - u_min)),
-            mlpdouble(v_min + t * (v_max - v_min))
-        });
-    }
-    trainer.SetCollocationPoints("colloc", physics_points);
+    // std::vector<std::vector<mlpdouble>> physics_points;
+    // const int Ncoll = 200;
+    // for (int i = 0; i < Ncoll; ++i) {
+    //     double t = static_cast<double>(i) / (Ncoll - 1);
+    //     physics_points.push_back({
+    //         mlpdouble(u_min + t * (u_max - u_min)),
+    //         mlpdouble(v_min + t * (v_max - v_min))
+    //     });
+    // }
+    // trainer.SetCollocationPoints("colloc", physics_points);
 
     // =========================================================================
     // 12. Register physics loss with trainer (ENABLED for PINN)
     // =========================================================================
-    trainer.AddPhysicsLoss(physics_loss, "colloc");
+    // trainer.AddPhysicsLoss(physics_loss, "colloc");
 
     // =========================================================================
     // 13. Build trainer

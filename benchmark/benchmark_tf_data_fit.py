@@ -141,7 +141,7 @@ for NN in hidden_layers:
     model.add(tf.keras.layers.Dense(NN, activation='tanh', kernel_initializer="he_uniform"))
 model.add(tf.keras.layers.Dense(1, activation='linear'))
 
-# Save initial weights so C++ can start from the exact same point
+# Save initial weights so MLPCpp can start from the exact same point
 Translate_Tensorflow_MLP(file_out="initial_model", input_names=["u", "v"], output_names=["y"], model=model,
                          scaler_input=scaler_function_x, input_norm_1=input_norm_1, input_norm_2=input_norm_2,
                          scaler_output=scaler_function_y, output_norm_1=output_norm_1, output_norm_2=output_norm_2)
@@ -164,7 +164,7 @@ print(f"\n======================================")
 print(f"Final MSE (raw y space): {mse_raw:.10e}")
 print(f"======================================\n")
 
-# Optional: Save final model if you want to test your C++ inference tool separately later
+# Optional: Save final model if you want to test your MLPCpp inference tool separately later
 Translate_Tensorflow_MLP(file_out="MLP_test", input_names=["u", "v"], output_names=["y"], model=model,
                          scaler_input=scaler_function_x, input_norm_1=input_norm_1, input_norm_2=input_norm_2,
                          scaler_output=scaler_function_y, output_norm_1=output_norm_1, output_norm_2=output_norm_2)
@@ -172,14 +172,14 @@ Translate_Tensorflow_MLP(file_out="MLP_test", input_names=["u", "v"], output_nam
 # ============================================================================
 # 6. Visualize Convergence Comparison
 # ============================================================================
-# Convert TF normalized loss to raw y-space loss to match C++ output
+# Convert TF normalized loss to raw y-space loss to match MLPCpp output
 # MSE_raw = MSE_norm * (y_max - y_min)^2
 y_range = output_norm_2[0] - output_norm_1[0]
 tf_loss_raw = [loss * (y_range**2) for loss in history.history['loss']]
 tf_epochs = np.arange(1, len(tf_loss_raw) + 1)
 
-# Check if C++ history file exists
-cpp_file = "data_fitting_history.csv"
+# Check if MLPCpp history file exists
+cpp_file = "pinn_training_history.csv"
 try:
     cpp_data = np.genfromtxt(cpp_file, delimiter=',', names=True)
     cpp_epochs = cpp_data['epoch']
@@ -188,7 +188,7 @@ try:
     plt.figure(figsize=(10, 6))
     plt.semilogy(tf_epochs, tf_loss_raw, 'r-', label='TensorFlow Data Loss (Raw Space)', linewidth=2)
     plt.semilogy(cpp_epochs, cpp_loss_data, 'b--', label='MLPCpp Data Loss (Raw Space)', linewidth=2)
-    plt.title('Data Fitting Convergence: TensorFlow vs C++')
+    plt.title('Data Fitting Convergence: TensorFlow vs MLPCpp')
     plt.xlabel('Epoch')
     plt.ylabel('Mean Squared Error (log scale)')
     plt.grid(True, which="both", ls="--", alpha=0.5)
@@ -198,4 +198,4 @@ try:
     print("Convergence plot saved to convergence_comparison.png")
     
 except Exception as e:
-    print(f"Could not read {cpp_file} or plot. Make sure to run the C++ test case first. Error: {e}")
+    print(f"Could not read {cpp_file} or plot. Make sure to run the MLPCpp test case first. Error: {e}")
